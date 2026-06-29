@@ -66,6 +66,42 @@ trellis init --cursor --opencode --codex -u your-name
 
 查看 [快速开始](https://docs.trytrellis.app/zh/start/install-and-first-task) 与 [支持平台](https://docs.trytrellis.app/zh/advanced/multi-platform) 指南以了解详细配置步骤。
 
+## 机器人开发（C++ / ROS 2）
+
+本 fork 提供一个**系统级的机器人画像**。在初始化时开启，Trellis 会脚手架一套 C++/ROS 2 规范包、安装 ROS 2 技能，并提供一个从 GitHub 拉取权威编码规范的工具——全部自动注入到你的 AI 编程会话中。
+
+### 在初始化时开启
+
+```bash
+# 交互式：对“是否机器人项目”回答 yes，然后勾选领域
+trellis init --claude
+
+# 非交互式：直接指定领域
+trellis init --claude --robotics --robot-domain mobile manipulator -y
+```
+
+领域（可多选）：`mobile`（移动）、`manipulator`（机械臂）、`legged`（足式）、`rl`（强化学习）、`vla`（视觉-语言-动作）。核心 C++/ROS 2 规范（代码风格、实时高性能、ROS 2 约定、动力学、构建工具）总是写入；每个勾选的领域追加各自的指南。
+
+开启机器人画像会写入：
+
+| 内容 | 位置 |
+| --- | --- |
+| 规范包（自动注入 AI 会话） | `.trellis/spec/robotics/` |
+| 抓取工具的源注册表 | `.trellis/spec-sources.json` |
+| 机器人画像（`enabled` + `domains`） | `.trellis/config.yaml` |
+| ROS 2 技能 `ros2-control`、`ros2-nav2`、`ros2-moveit2` | 你所用平台的技能目录（如 `.claude/skills/`） |
+
+非机器人项目完全不受影响——不会写入 `.trellis/spec/robotics/`，也不会安装任何 ROS 2 技能。
+
+### 从 GitHub 刷新规范
+
+```bash
+python3 .trellis/scripts/import_spec.py            # 抓取并写入受管区块
+python3 .trellis/scripts/import_spec.py --dry-run  # 仅预览，不写入
+```
+
+编辑 `.trellis/spec-sources.json` 增加源或把 `url` 指向任意 raw 文件。抓取工具只会改写 `<!-- trellis:managed:* -->` 受管区块内的内容（区块外你的修改会被保留），且**幂等**——上游不变时重复运行不产生任何 diff。
+
 ## 如何使用
 
 使用流程非常简单：

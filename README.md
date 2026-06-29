@@ -66,6 +66,42 @@ trellis init --cursor --opencode --codex -u your-name
 
 See the [Quick Start](https://docs.trytrellis.app/start/install-and-first-task) and [Supported Platforms](https://docs.trytrellis.app/advanced/multi-platform) guides for setup details.
 
+## Robotics (C++ / ROS 2)
+
+This fork ships a **system-level robotics profile**. Opt in at init and Trellis scaffolds a C++/ROS 2 spec pack, installs ROS 2 skills, and gives you a tool to pull authoritative coding standards from GitHub — all auto-injected into your AI coding sessions.
+
+### Enable it at init
+
+```bash
+# Interactive: answer "yes" to the robotics question, then pick domains
+trellis init --claude
+
+# Non-interactive: choose domains directly
+trellis init --claude --robotics --robot-domain mobile manipulator -y
+```
+
+Domains (multi-select): `mobile`, `manipulator`, `legged`, `rl`, `vla`. The core C++/ROS 2 specs (style, real-time performance, ROS 2 conventions, dynamics, build tooling) are always written; each selected domain adds its own guideline.
+
+Enabling robotics writes:
+
+| What | Where |
+| --- | --- |
+| Spec pack (auto-injected into AI sessions) | `.trellis/spec/robotics/` |
+| Scraper source registry | `.trellis/spec-sources.json` |
+| Robotics profile (`enabled` + `domains`) | `.trellis/config.yaml` |
+| ROS 2 skills `ros2-control`, `ros2-nav2`, `ros2-moveit2` | your platform's skills dir (e.g. `.claude/skills/`) |
+
+Non-robotics projects are unaffected — nothing under `.trellis/spec/robotics/` is written and no ROS 2 skills are installed.
+
+### Refresh standards from GitHub
+
+```bash
+python3 .trellis/scripts/import_spec.py            # fetch + write the managed regions
+python3 .trellis/scripts/import_spec.py --dry-run  # preview without writing
+```
+
+Edit `.trellis/spec-sources.json` to add sources or point `url` at any raw file. The importer only rewrites inside `<!-- trellis:managed:* -->` regions (your edits outside them are preserved) and is **idempotent** — re-running with unchanged upstream produces no diff.
+
 ## How to Use
 
 The workflow is simple:

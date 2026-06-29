@@ -196,7 +196,11 @@ colcon test --packages-select my_robot_controller --event-handlers console_direc
 
 ## Sourced standards
 
-Upstream style references, refreshable via `python3 .trellis/scripts/import_spec.py`.
+ROS 2 follows the Google C++ Style Guide with a 100-character line limit. For
+safety-critical robots, also align with **MISRA C++:2023** — the current unified
+standard that merges the older AUTOSAR C++14 ruleset into MISRA.
+
+Upstream references refreshable via `python3 .trellis/scripts/import_spec.py`.
 Edit anywhere outside the managed region below; the importer only rewrites inside it.
 
 <!-- trellis:managed:style-sources START -->

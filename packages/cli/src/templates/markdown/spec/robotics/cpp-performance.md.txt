@@ -95,15 +95,19 @@ A mutex shared by a low-priority non-RT thread and a high-priority RT thread cau
 deadline. Hand data across with `realtime_tools` instead.
 
 ```cpp
-#include <realtime_tools/realtime_buffer.hpp>
+// realtime_tools (Rolling): RealtimeThreadSafeBox for a latest-value handoff,
+// LockFreeQueue when intermediate samples must not be dropped.
+#include <realtime_tools/realtime_thread_safe_box.hpp>
 #include <realtime_tools/realtime_publisher.hpp>
 
-realtime_tools::RealtimeBuffer<Command> rt_command_buffer_;     // SPSC double buffer
+realtime_tools::RealtimeThreadSafeBox<Command> rt_command_box_;  // latest value, best-effort
 
-void commandCallback(const CommandMsg & msg) {                  // non-RT
-  rt_command_buffer_.writeFromNonRT(toCommand(msg));            // never blocks RT reader
+void commandCallback(const CommandMsg & msg) {                   // non-RT writer
+  rt_command_box_.set(toCommand(msg));                           // never blocks the RT reader
 }
-const Command cmd = *rt_command_buffer_.readFromRT();           // RT
+if (const auto cmd = rt_command_box_.tryGet()) {                 // RT: non-blocking read
+  apply(*cmd);                                                   // std::optional<Command>
+}
 
 // Publish telemetry FROM the RT path without blocking on the DDS write:
 realtime_tools::RealtimePublisher<StateMsg> rt_pub_{pub};
@@ -113,8 +117,9 @@ if (rt_pub_.trylock()) {           // non-blocking; skip this cycle if held
 }
 ```
 
-- `RealtimeBuffer` / `RealtimeBox` for single-value handoff; an SPSC lock-free queue for
-  streams. Use `std::atomic<T>` (correct memory order) only for trivially-copyable POD.
+- `RealtimeThreadSafeBox` for a latest-value handoff, `LockFreeQueue` for streams where
+  intermediate samples matter. (`RealtimeBuffer` is the older, now-superseded equivalent.)
+  Use `std::atomic<T>` (correct memory order) only for trivially-copyable POD.
 - Never `lock()` a `RealtimePublisher` on the RT path — `trylock()` and drop the sample.
   A lost telemetry sample is fine; a missed control deadline is not.
 

@@ -1,25 +1,33 @@
 {
-  "_comment": "Authoritative C++/robotics standards refreshed into managed regions of .trellis/spec/robotics/ by import_spec.py. Edit freely: add/remove sources, point url at any raw file. target = spec file under spec/robotics; region = managed-region id present in that file.",
+  "_comment": "Authoritative C++/robotics standards refreshed into managed regions of .trellis/spec/robotics/ by import_spec.py. URLs are scraper-friendly raw sources (raw.githubusercontent.com / google.github.io) — avoid docs.ros.org, which is behind bot protection. target = spec file under spec/robotics; region = a <!-- trellis:managed:<region> --> block present in that file.",
   "sources": [
     {
       "id": "google-cpp-style",
       "name": "Google C++ Style Guide",
-      "url": "https://raw.githubusercontent.com/google/styleguide/gh-pages/cppguide.html",
+      "url": "https://google.github.io/styleguide/cppguide.html",
       "target": "cpp-style.md",
       "region": "style-sources",
       "license": "CC-BY-3.0"
     },
     {
-      "id": "ros2-developer-guide",
-      "name": "ROS 2 Developer Guide",
-      "url": "https://raw.githubusercontent.com/ros2/ros2_documentation/rolling/source/The-ROS2-Project/Contributing/Developer-Guide.rst",
+      "id": "ros2-code-style",
+      "name": "ROS 2 Code Style and Language Versions",
+      "url": "https://raw.githubusercontent.com/ros2/ros2_documentation/rolling/source/The-ROS2-Project/Contributing/Code-Style-Language-Versions.rst",
       "target": "cpp-style.md",
       "region": "style-sources",
       "license": "CC-BY-4.0"
     },
     {
+      "id": "ros2-developer-guide",
+      "name": "ROS 2 Developer Guide",
+      "url": "https://raw.githubusercontent.com/ros2/ros2_documentation/rolling/source/The-ROS2-Project/Contributing/Developer-Guide.rst",
+      "target": "ros2-conventions.md",
+      "region": "ros2-sources",
+      "license": "CC-BY-4.0"
+    },
+    {
       "id": "realtime-tools",
-      "name": "ros-controls realtime_tools",
+      "name": "ros-controls realtime_tools (RealtimeThreadSafeBox / LockFreeQueue / RealtimePublisher)",
       "url": "https://raw.githubusercontent.com/ros-controls/realtime_tools/master/README.md",
       "target": "cpp-performance.md",
       "region": "rt-sources",

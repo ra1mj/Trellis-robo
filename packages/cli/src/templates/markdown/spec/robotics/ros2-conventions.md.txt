@@ -351,4 +351,14 @@ def generate_launch_description():
 
 ---
 
+## Sourced standards
+
+Upstream ROS 2 references, refreshable via `python3 .trellis/scripts/import_spec.py`.
+
+<!-- trellis:managed:ros2-sources START -->
+<!-- Populated by import_spec.py from .trellis/spec-sources.json. -->
+<!-- trellis:managed:ros2-sources END -->
+
+---
+
 **Language**: All documentation should be written in **English**.

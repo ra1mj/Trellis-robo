@@ -1,0 +1,175 @@
+# Mobile Robots (Wheeled / Differential-Drive)
+
+> Conventions for wheeled mobile robots on ROS 2: kinematics, odometry fusion,
+> ros2_control, Nav2, the TF tree, and velocity-command safety.
+
+---
+
+## Overview
+
+This guide covers ground robots driven by wheels — differential-drive, skid-steer, and
+holonomic (mecanum / omni) platforms. The default stack is `ros2_control` for the wheel
+controllers, `robot_localization` for state fusion, and Nav2 for autonomous navigation.
+Read [Dynamics](../../dynamics.md) for frame and unit conventions (REP-103: x-forward,
+y-left, z-up; right-handed; SI units) before touching any of the math below.
+
+---
+
+## Kinematics
+
+Keep kinematics in a header-only, ROS-free struct so it can be unit-tested and reused
+inside the real-time controller. Wheel radius `r`, wheel separation (track width) `L`.
+
+### Differential drive
+
+```cpp
+// Body twist (v [m/s], w [rad/s]) -> wheel angular velocities [rad/s].
+// Forward: v = r*(wr+wl)/2 ;  w = r*(wr-wl)/L
+struct DiffDrive {
+  double r;  // wheel radius
+  double L;  // track width (left-right separation)
+  std::pair<double, double> inverse(double v, double w) const {
+    return {(v - w * L / 2.0) / r,    // left wheel
+            (v + w * L / 2.0) / r};   // right wheel
+  }
+};
+```
+
+### Omnidirectional (mecanum)
+
+```cpp
+// vx, vy [m/s], wz [rad/s]; k = lx + ly (half wheelbase + half track).
+// Wheel order: front-left, front-right, rear-left, rear-right.
+std::array<double, 4> mecanumInverse(double vx, double vy, double wz,
+                                     double r, double k) {
+  return {(vx - vy - k * wz) / r, (vx + vy + k * wz) / r,
+          (vx + vy - k * wz) / r, (vx - vy + k * wz) / r};
+}
+```
+
+---
+
+## Odometry & state estimation
+
+Wheel odometry integrates encoder deltas; it drifts and **must** be fused with IMU/GNSS,
+not trusted alone. Use `robot_localization`'s `ekf_node` — wheel odom supplies linear x
+and yaw rate, the IMU supplies orientation/yaw.
+
+```yaml
+ekf_filter_node:
+  ros__parameters:
+    frequency: 50.0
+    two_d_mode: true            # planar robot: lock z, roll, pitch
+    map_frame: map
+    odom_frame: odom
+    base_link_frame: base_link
+    world_frame: odom           # this EKF publishes odom->base_link
+    odom0: /diff_drive_controller/odom
+    odom0_config: [false, false, false,  false, false, false,
+                   true,  false, false,  false, false, true,   false, false, false]
+    imu0: /imu/data
+    imu0_config: [false, false, false,  false, false, true,
+                  false, false, false,  false, false, true,   true,  false, false]
+```
+
+`two_d_mode: true` is mandatory for planar robots — it stops sensor noise from leaking
+into z/roll/pitch and producing a tilted base frame.
+
+---
+
+## ros2_control + diff_drive_controller
+
+`diff_drive_controller` consumes `geometry_msgs/TwistStamped` on `~/cmd_vel` and
+publishes `nav_msgs/Odometry`. Configure wheel names, geometry, and limits in YAML —
+the same `wheel_separation`/`wheel_radius` the kinematics struct uses.
+
+```yaml
+diff_drive_controller:
+  ros__parameters:
+    left_wheel_names:  [left_wheel_joint]
+    right_wheel_names: [right_wheel_joint]
+    wheel_separation: 0.43
+    wheel_radius: 0.085
+    odom_frame_id: odom
+    base_frame_id: base_link
+    enable_odom_tf: false          # let the EKF own odom->base_link
+    linear.x.max_velocity:  1.2    # m/s
+    linear.x.max_acceleration: 1.5 # m/s^2
+    angular.z.max_velocity: 2.0    # rad/s
+```
+
+Set `enable_odom_tf: false` whenever an EKF is running, otherwise two nodes publish
+`odom->base_link` and TF fights itself.
+
+---
+
+## Nav2
+
+Standard server set: `bt_navigator` (Behavior Tree), `planner_server` (global, e.g.
+`SmacPlannerHybrid` or `NavfnPlanner`), `controller_server` (local, e.g.
+`RegulatedPurePursuitController` or DWB), `behavior_server` (recoveries), plus global
+and local `costmap` instances. Tune `costmap` `robot_radius`/`footprint` and the
+`inflation_layer` to real robot size — an under-sized footprint clips corners.
+
+```yaml
+controller_server:
+  ros__parameters:
+    controller_frequency: 20.0
+    FollowPath:
+      plugin: nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController
+      desired_linear_vel: 0.8
+      max_angular_accel: 2.0
+```
+
+Nav2 commands must match the controller's velocity limits; if Nav2 asks for 1.5 m/s but
+`diff_drive_controller` caps at 1.2, tracking degrades silently.
+
+---
+
+## TF tree
+
+One unbroken chain, single publisher per edge:
+
+```
+map --(amcl / slam)--> odom --(ekf_node)--> base_link --(URDF static)--> sensors
+```
+
+- `map->odom`: localization (AMCL or SLAM) — corrects long-term drift.
+- `odom->base_link`: the EKF — continuous, smooth, never jumps.
+- `base_link->*`: static transforms from the URDF via `robot_state_publisher`.
+
+Never let two nodes publish the same edge, and never publish `map->base_link` directly.
+
+---
+
+## Velocity commands & safety
+
+- Topic: `cmd_vel`. Humble uses `geometry_msgs/Twist`; Jazzy/Rolling Nav2 and
+  `diff_drive_controller` use `geometry_msgs/TwistStamped` — match your distro.
+- Clamp linear/angular velocity AND acceleration at the controller, never trust the
+  upstream planner to stay in bounds.
+- Implement a `cmd_vel` watchdog: if no command arrives within `cmd_vel_timeout`
+  (e.g. 0.5 s), command zero velocity. `diff_drive_controller` does this natively.
+- E-stop must cut at the hardware interface layer (zero the wheel command), not only by
+  dropping `cmd_vel` — a stale buffered command can otherwise still move the robot.
+
+---
+
+## Common mistakes
+
+- **Trusting wheel odometry alone.** Encoders drift from slip and calibration error;
+  always fuse with an IMU through `robot_localization`.
+- **Two publishers on `odom->base_link`.** Leaving `enable_odom_tf: true` while an EKF
+  runs makes TF oscillate; pick one owner.
+- **Unbounded `cmd_vel`.** Forwarding raw planner output without velocity/accel clamps
+  and a watchdog lets a glitch or stale message launch the robot.
+- **Frame confusion.** Sending `cmd_vel` in `map` instead of `base_link`, or mixing up
+  `wheel_separation` (full track) with half-track, flips or scales motion.
+- **Footprint too small.** An optimistic costmap `robot_radius` makes the planner cut
+  corners and clip obstacles.
+- **`two_d_mode: false` on a planar robot.** Lets sensor noise tilt the base frame and
+  corrupt navigation.
+
+---
+
+**Language**: All documentation should be written in **English**.

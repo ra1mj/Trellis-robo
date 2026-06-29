@@ -99,6 +99,11 @@ program
   .option("-s, --skip-existing", "Skip existing files without asking")
   .option("--monorepo", "Force monorepo mode")
   .option("--no-monorepo", "Skip monorepo detection")
+  .option("--robotics", "Scaffold the robotics (ROS 2 / C++) spec pack")
+  .option(
+    "--robot-domain <domains...>",
+    "Robotics domains to scaffold: mobile, manipulator, legged, rl, vla",
+  )
   .option(
     "-t, --template <name>",
     "Use a remote spec template (e.g., electron-fullstack)",

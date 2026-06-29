@@ -1,0 +1,354 @@
+# ROS 2 Conventions
+
+> Idiomatic ROS 2 (rclcpp) patterns for nodes, executors, QoS, parameters, interfaces,
+> time/TF, logging, and packaging. C++17 baseline (ROS 2 Humble/Jazzy). Prefer composition
+> and managed lifecycles; keep the real-time control path out of the middleware.
+
+---
+
+## Overview
+
+These are the conventions every ROS 2 C++ node in this project must follow. They favor
+**composable, lifecycle-managed nodes**, explicit **QoS**, **typed parameters**, and
+correct **time/TF** handling. The middleware (DDS) is not real-time — keep hard-real-time
+control in `ros2_control` controllers or a dedicated RT thread (see
+[C++ Performance](./cpp-performance.md)), and use topics/services/actions for the
+non-RT boundary.
+
+---
+
+## Node design: components and lifecycle
+
+Write nodes as **`rclcpp_components` composable nodes**, not `main()`-only processes.
+Composition lets multiple nodes share a process (and intra-process zero-copy), and a
+component can still be run standalone via a generated container.
+
+```cpp
+// perception_node.hpp
+#include <rclcpp/rclcpp.hpp>
+
+namespace my_robot {
+class PerceptionNode : public rclcpp::Node {
+ public:
+  explicit PerceptionNode(const rclcpp::NodeOptions & options);
+ private:
+  rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr image_sub_;
+};
+}  // namespace my_robot
+```
+
+```cpp
+// perception_node.cpp
+#include "rclcpp_components/register_node_macro.hpp"
+RCLCPP_COMPONENTS_REGISTER_NODE(my_robot::PerceptionNode)
+```
+
+For **hardware drivers, controllers, and anything with a startup/shutdown sequence**, use
+a managed `rclcpp_lifecycle::LifecycleNode`. Acquire hardware in `on_activate`, release it
+in `on_deactivate` / `on_cleanup` — never in the constructor.
+
+```cpp
+class MotorDriver : public rclcpp_lifecycle::LifecycleNode {
+  using CallbackReturn =
+      rclcpp_lifecycle::node_interfaces::LifecycleNodeInterface::CallbackReturn;
+  CallbackReturn on_configure(const rclcpp_lifecycle::State &) override {
+    pub_ = create_publisher<JointState>("~/joint_states", rclcpp::SensorDataQoS());
+    return CallbackReturn::SUCCESS;  // declare params + interfaces, no I/O yet
+  }
+  CallbackReturn on_activate(const rclcpp_lifecycle::State &) override {
+    if (!open_can_bus()) return CallbackReturn::FAILURE;
+    pub_->on_activate();
+    return CallbackReturn::SUCCESS;
+  }
+};
+```
+
+**Rule**: composition over many one-node processes; lifecycle for any node owning a
+resource that must be deterministically configured, activated, and torn down.
+
+---
+
+## Executors & callback groups
+
+Pick the executor deliberately — the default `SingleThreadedExecutor` runs every callback
+on one thread, so a slow callback blocks all others.
+
+| Executor | Use when |
+|----------|----------|
+| `SingleThreadedExecutor` | Simple nodes, deterministic ordering, low load |
+| `MultiThreadedExecutor` | Independent callbacks that must run concurrently |
+| `StaticSingleThreadedExecutor` | Fixed callback set, lower overhead per spin |
+| Realtime / dedicated RT thread | Control update loop — do **not** spin RT logic on a normal executor |
+
+Concurrency is controlled by **callback groups**:
+
+- `MutuallyExclusive` (default) — callbacks in the group never run concurrently.
+- `Reentrant` — callbacks may run in parallel across executor threads.
+
+```cpp
+// A blocking service client called from inside a timer must be in a SEPARATE
+// reentrant group, or the executor deadlocks waiting on itself.
+cb_group_ = create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+auto opts = rclcpp::SubscriptionOptions();
+opts.callback_group = cb_group_;
+sub_ = create_subscription<Imu>("imu", rclcpp::SensorDataQoS(), cb, opts);
+
+rclcpp::executors::MultiThreadedExecutor exec;
+exec.add_node(node);
+exec.spin();
+```
+
+**Rule**: hard-real-time control runs in `ros2_control`'s update loop or a `pthread` with
+RT priority — not on a `MultiThreadedExecutor`.
+
+---
+
+## QoS: match publisher and subscriber
+
+QoS mismatch silently drops the connection (no error, just no data). Use the named
+profiles instead of hand-rolling settings.
+
+| Profile | Reliability | Durability | History | Typical use |
+|---------|-------------|------------|---------|-------------|
+| `SensorDataQoS()` | best-effort | volatile | keep-last (5) | LiDAR, camera, IMU |
+| Default (`rclcpp::QoS(10)`) | reliable | volatile | keep-last (10) | commands, state |
+| `transient_local` | reliable | transient-local | keep-last (1) | latched: map, robot_description |
+
+```cpp
+// Latched topic: late-joining subscribers still receive the last sample.
+auto map_qos = rclcpp::QoS(1).transient_local().reliable();
+map_pub_ = create_publisher<OccupancyGrid>("map", map_qos);
+
+// Sensor stream: drop, never block the producer.
+imu_sub_ = create_subscription<Imu>("imu/data", rclcpp::SensorDataQoS(), cb);
+```
+
+**Pitfall**: a `reliable` subscriber will **not** connect to a `best_effort` publisher;
+a `volatile` subscriber on a `transient_local` topic misses the latched sample. Match
+reliability and durability on both ends. Use `ros2 topic info -v <topic>` to debug.
+
+---
+
+## Parameters: declare, constrain, validate
+
+Declare every parameter once with a descriptor (ranges + description). Never read an
+undeclared parameter.
+
+```cpp
+rcl_interfaces::msg::ParameterDescriptor desc;
+desc.description = "Control loop rate in Hz";
+rcl_interfaces::msg::FloatingPointRange range;
+range.from_value = 50.0; range.to_value = 1000.0; range.step = 0.0;
+desc.floating_point_range = {range};
+control_rate_ = declare_parameter<double>("control_rate", 200.0, desc);
+```
+
+Validate dynamic updates with a callback that can reject:
+
+```cpp
+param_cb_ = add_on_set_parameters_callback(
+    [this](const std::vector<rclcpp::Parameter> & params) {
+      rcl_interfaces::msg::SetParametersResult res;
+      res.successful = true;
+      for (const auto & p : params) {
+        if (p.get_name() == "control_rate" && p.as_double() <= 0.0) {
+          res.successful = false;
+          res.reason = "control_rate must be > 0";
+        }
+      }
+      return res;
+    });
+```
+
+For non-trivial parameter sets, prefer **`generate_parameter_library`**: declare the
+schema in YAML and get a typed, validated, auto-documented C++ struct — no hand-written
+`declare_parameter` boilerplate.
+
+```yaml
+# my_controller_parameters.yaml
+my_controller:
+  control_rate:
+    type: double
+    default_value: 200.0
+    validation: { bounds<>: [50.0, 1000.0] }
+  joint_names:
+    type: string_array
+    default_value: []
+```
+
+---
+
+## Interfaces & naming
+
+- **Topics** (`/`-namespaced, snake_case): continuous data streams. `~/foo` for
+  node-private topics (`cmd_vel`, `joint_states`, `scan`).
+- **Services**: short, infrequent request/response with an immediate answer
+  (`/reset_odometry`, `/set_mode`). Do **not** use a service for long-running work.
+- **Actions**: goal-oriented, long-running, cancellable, with feedback
+  (`/navigate_to_pose`, `/follow_joint_trajectory`).
+
+Design messages small and **stamped**. Reuse `common_interfaces` (`geometry_msgs`,
+`sensor_msgs`, `nav_msgs`) before inventing custom types; put a `std_msgs/Header` on
+anything spatial or time-sensitive.
+
+```
+# GoodState.msg  — stamped, focused
+std_msgs/Header header
+geometry_msgs/Pose pose
+geometry_msgs/Twist twist
+```
+
+**Rule**: one giant "everything" message is an anti-pattern — subscribers pay for fields
+they ignore and every change forces a rebuild. Split by update rate and concern.
+
+---
+
+## Time & TF
+
+Always read time from the **node clock** so `use_sim_time` works in simulation and bag
+replay. Never use wall/system clock for ROS timestamps.
+
+```cpp
+// GOOD — respects use_sim_time
+rclcpp::Time stamp = now();           // inside an rclcpp::Node
+msg.header.stamp = this->get_clock()->now();
+
+// BAD — ignores simulated time, breaks bag replay and Gazebo
+auto t = std::chrono::system_clock::now();
+```
+
+Enable simulated time when running against a simulator/bag:
+
+```yaml
+/**:
+  ros__parameters:
+    use_sim_time: true
+```
+
+Use a TF2 buffer + listener, and **always pass a timeout** to `lookupTransform` so a
+missing transform doesn't throw immediately:
+
+```cpp
+tf_buffer_ = std::make_unique<tf2_ros::Buffer>(get_clock());
+tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+try {
+  auto tf = tf_buffer_->lookupTransform(
+      "base_link", "odom", tf2::TimePointZero, tf2::durationFromSec(0.1));
+} catch (const tf2::TransformException & ex) {
+  RCLCPP_WARN(get_logger(), "TF lookup failed: %s", ex.what());
+}
+```
+
+`tf2::TimePointZero` asks for the latest available transform — prefer it over a precise
+stamp when you only need "the current" relationship and can tolerate small skew.
+
+---
+
+## Logging
+
+Use the `RCLCPP_*` macros (they integrate with `/rosout` and log levels). For anything in
+a hot loop, use the **throttled** variants — and never log on the real-time control path.
+
+```cpp
+RCLCPP_INFO(get_logger(), "Reached goal at %.2f m", distance);
+RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000 /*ms*/, "Battery low: %d%%", pct);
+// In an RT controller update(): no logging, no streams, no allocation.
+```
+
+**Rule**: log levels are `DEBUG/INFO/WARN/ERROR/FATAL`; ship at `INFO`. Throttle per-cycle
+diagnostics; route high-rate signals to a topic, not the log.
+
+---
+
+## Package layout (`ament_cmake`)
+
+```
+my_robot_driver/
+├── package.xml              # <buildtool_depend>ament_cmake</buildtool_depend>
+├── CMakeLists.txt
+├── include/my_robot_driver/ # public headers (installed)
+├── src/                     # node/component implementations
+├── launch/                  # *.launch.py
+├── config/                  # *.yaml parameter files
+└── test/                    # gtest + launch_testing
+```
+
+```cmake
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(rclcpp_components REQUIRED)
+
+add_library(perception_component SHARED src/perception_node.cpp)
+ament_target_dependencies(perception_component rclcpp rclcpp_components sensor_msgs)
+rclcpp_components_register_nodes(perception_component "my_robot::PerceptionNode")
+
+install(TARGETS perception_component LIBRARY DESTINATION lib)
+install(DIRECTORY launch config DESTINATION share/${PROJECT_NAME})
+ament_package()
+```
+
+## Python launch conventions
+
+Launch files are Python; declare `DeclareLaunchArgument`s, load YAML params, and prefer a
+`ComposableNodeContainer` to co-locate composable nodes.
+
+```python
+from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch_ros.actions import ComposableNodeContainer
+from launch_ros.descriptions import ComposableNode
+from launch_ros.substitutions import FindPackageShare
+
+
+def generate_launch_description():
+    params = PathJoinSubstitution(
+        [FindPackageShare("my_robot_driver"), "config", "driver.yaml"]
+    )
+    return LaunchDescription([
+        DeclareLaunchArgument("use_sim_time", default_value="false"),
+        ComposableNodeContainer(
+            name="robot_container",
+            namespace="",
+            package="rclcpp_components",
+            executable="component_container_mt",  # multi-threaded container
+            composable_node_descriptions=[
+                ComposableNode(
+                    package="my_robot_driver",
+                    plugin="my_robot::PerceptionNode",
+                    name="perception",
+                    parameters=[params,
+                                {"use_sim_time": LaunchConfiguration("use_sim_time")}],
+                ),
+            ],
+            output="screen",
+        ),
+    ])
+```
+
+---
+
+## Common mistakes
+
+- **Doing hardware I/O in a node/lifecycle constructor.** Construction must be cheap and
+  side-effect-free; open devices in `on_activate`, close in `on_deactivate`.
+- **QoS mismatch with no error.** A `reliable` subscriber never connects to a
+  `best_effort` publisher. Match reliability/durability; debug with `ros2 topic info -v`.
+- **Blocking service call inside a timer/subscription on the same mutually-exclusive
+  group.** The executor deadlocks. Put the client in a separate `Reentrant` group with a
+  `MultiThreadedExecutor`.
+- **Using `std::chrono::system_clock` for ROS timestamps.** Breaks `use_sim_time`, bag
+  replay, and Gazebo. Always use `node->now()` / `get_clock()->now()`.
+- **`lookupTransform` without a timeout.** Throws immediately on a not-yet-available
+  transform; pass a duration and catch `tf2::TransformException`.
+- **Logging on the real-time path.** `RCLCPP_INFO` allocates and locks. No logging,
+  allocation, or exceptions in a controller `update()` — see [C++ Performance](./cpp-performance.md).
+- **One process per node.** Use `rclcpp_components` composition for intra-process
+  transport and fewer DDS participants.
+- **Giant catch-all messages.** Split by concern and rate; keep messages stamped with
+  `std_msgs/Header`.
+
+---
+
+**Language**: All documentation should be written in **English**.

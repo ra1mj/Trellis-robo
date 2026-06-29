@@ -1,0 +1,88 @@
+# Robotics (C++ / ROS 2) Development Guidelines
+
+> High-performance C++ robotics conventions for this project. ROS 2 is the default
+> target. These docs are shipped concrete — adapt the project-specific parts (package
+> names, hardware, control rates) to your robot.
+
+---
+
+## Overview
+
+This directory holds the engineering standard for writing **real-time-capable C++
+robotics code on ROS 2**. It is split into always-present core guidelines plus
+optional per-domain guidelines imported by your `trellis init` robot-domain selection.
+
+The goal: any AI coding session or new team member writes code that respects the
+hard-real-time control path, ROS 2 idioms, and the robot's dynamics conventions —
+without re-deriving them each time.
+
+---
+
+## Guidelines Index
+
+### Core (always present)
+
+| Guide | Description |
+|-------|-------------|
+| [C++ Style](./cpp-style.md) | Naming, headers, include order, namespaces, clang-format / clang-tidy |
+| [C++ Performance](./cpp-performance.md) | Real-time loop rules, allocation discipline, move/RAII, cache, lock-free; bare-metal/RTOS profile |
+| [ROS 2 Conventions](./ros2-conventions.md) | Nodes/components, lifecycle, executors, QoS/DDS, parameters, ament package layout |
+| [Dynamics](./dynamics.md) | Frames (REP-103/105), kinematics, Jacobians, FK/IK, equations of motion, control basics, units |
+| [Build & Tooling](./build-tooling.md) | CMake / ament_cmake / colcon, sanitizers, gtest / ament_lint, CI |
+
+### Domains (present only if selected at init)
+
+| Domain | Description |
+|--------|-------------|
+| [Mobile](./domains/mobile/index.md) | Wheeled / differential-drive kinematics, odometry, ros2_control, Nav2, TF |
+| [Manipulator](./domains/manipulator/index.md) | Serial-chain kinematics/dynamics, MoveIt 2, joint-trajectory control, collision |
+| [Legged](./domains/legged/index.md) | Floating-base dynamics, contact/gait, whole-body control, state estimation |
+| [RL](./domains/rl/index.md) | Training/sim (Isaac Lab / Gym), policy export, sim2real, real-time inference |
+| [VLA](./domains/vla/index.md) | Vision-language-action stacks, model serving, latency budgets, safety gating |
+
+---
+
+## Pre-Development Checklist
+
+Before writing or editing robotics C++ code, read the guideline that matches the work:
+
+- Touching a **real-time control loop** (controller update, hardware interface, EtherCAT
+  cycle)? → read [C++ Performance](./cpp-performance.md) first. No heap, no locks, no
+  exceptions, no logging in the RT path.
+- Writing a **ROS 2 node / component / lifecycle node**? → read [ROS 2 Conventions](./ros2-conventions.md)
+  (executors, QoS, parameters, composition).
+- Implementing **kinematics / dynamics / a controller law**? → read [Dynamics](./dynamics.md)
+  for frame and unit conventions before you choose a representation.
+- Adding a **package / build target / test**? → read [Build & Tooling](./build-tooling.md).
+- Working inside a selected **domain** (mobile / manipulator / legged / rl / vla)? → read
+  that domain's `index.md`.
+
+## Quality Check
+
+After writing code, verify:
+
+- [ ] RT-path code allocates nothing, takes no locks, throws nothing, logs nothing.
+- [ ] `clang-format` and `clang-tidy` pass with the project config (see [C++ Style](./cpp-style.md)).
+- [ ] ROS 2 interfaces (topics/services/actions/params) follow the naming + QoS rules.
+- [ ] Frames, units, and sign conventions match [Dynamics](./dynamics.md) (REP-103/105).
+- [ ] New code has a `gtest` (and, for nodes, a launch_testing integration test).
+- [ ] `colcon build` + `colcon test` are green; sanitizers clean for non-RT code.
+
+---
+
+## Sourced standards
+
+Some sections of these guidelines can be refreshed from authoritative upstream sources
+(ROS 2 / ament developer guide, Google C++ Style, Drake, AUTOSAR C++14) via:
+
+```
+python3 .trellis/scripts/import_spec.py
+```
+
+Imported content lives inside `<!-- trellis:managed:<id> -->` regions and carries
+provenance links. Edit freely **outside** those regions; the importer only rewrites
+inside them.
+
+---
+
+**Language**: All documentation should be written in **English**.

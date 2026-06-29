@@ -1,0 +1,268 @@
+# C++ Performance & Real-Time Discipline
+
+> How to write C++ that survives the hard-real-time control path: no heap, no locks,
+> no exceptions, no I/O. ROS 2 + `ros2_control` is the default; a bare-metal / RTOS
+> profile is at the bottom.
+
+---
+
+## Overview
+
+"Fast" and "real-time" are not the same. The control path needs **bounded worst-case
+execution time (WCET)** far more than peak throughput. A loop that averages 50 µs but
+occasionally stalls 5 ms — a page fault, a `malloc` under lock contention, a priority
+inversion — is broken: it misses its deadline and the robot jerks, oscillates, or
+faults. This file is the contract for code on the RT path. Everything off the RT path
+(planning, perception, logging, parameters) may use the full standard library freely.
+
+---
+
+## 1. What is the "real-time path"
+
+Every instruction inside the deterministic control cycle:
+
+- `ControllerInterface::update()` (controller-manager rate, often 500 Hz–4 kHz),
+- `hardware_interface` `read()` / `write()`,
+- the EtherCAT / CAN / fieldbus cyclic callback (IgH master, SOEM, vendor PDO),
+- anything transitively called from the above.
+
+**Golden rule — on the RT path do NOT:** allocate/free heap, take a mutex a non-RT
+thread can hold, `throw`, make syscalls / I/O / logging, or run loops whose bound
+depends on runtime data.
+
+```cpp
+// Controller update: bounded, allocation-free, lock-free.
+controller_interface::return_type MyController::update(
+    const rclcpp::Time &, const rclcpp::Duration &)
+{
+  const Command cmd = *rt_command_buffer_.readFromRT();   // by value, fixed size
+  for (std::size_t i = 0; i < kNumJoints; ++i) {          // compile-time bound
+    const double err = cmd.position[i] - state_position_[i];
+    effort_[i] = kp_[i] * err + kd_[i] * (cmd.velocity[i] - state_velocity_[i]);
+    command_interfaces_[i].set_value(effort_[i]);
+  }
+  return controller_interface::return_type::OK;
+}
+```
+
+---
+
+## 2. Allocation discipline
+
+Allocate during `on_configure` / `on_activate`; **never on the RT path**. The allocator
+can take a lock and can trigger a page fault — both unbounded.
+
+```cpp
+std::array<double, kNumJoints> kp_{};        // fixed capacity, no heap
+std::vector<double> traj_buffer_;            // grown ONCE, off the RT path
+
+CallbackReturn on_activate(const rclcpp_lifecycle::State &) override {
+  traj_buffer_.reserve(kMaxTrajPoints);      // reserve here, not in update()
+  return CallbackReturn::SUCCESS;
+}
+```
+
+- Prefer `std::array<T,N>` / fixed-capacity ring buffers over `std::vector` on the RT
+  path; if you must use `std::vector`, `reserve()` off-path and never exceed capacity.
+- No `std::string` on the RT path. No `std::function` in the hot loop (may heap-allocate
+  + indirect call) — use a function pointer or a value-captured templated callable.
+- Avoid `std::shared_ptr` churn: a copy is a contended atomic refcount, the last
+  destructor frees. Hold it off-path; pass `T*` / `T&` into the loop.
+- For bounded-dynamic needs use an **object pool** or a real-time allocator (TLSF —
+  Two-Level Segregate Fit — gives O(1) `malloc`/`free`).
+
+```cpp
+template <typename T, std::size_t N>
+class Pool {                       // O(1) acquire/release, no heap after construction
+  std::array<T, N> storage_;
+  std::array<bool, N> used_{};
+public:
+  T * acquire() {                  // bounded: at most N checks
+    for (std::size_t i = 0; i < N; ++i)
+      if (!used_[i]) { used_[i] = true; return &storage_[i]; }
+    return nullptr;                // exhausted — handle, never allocate
+  }
+  void release(T * p) { used_[p - storage_.data()] = false; }
+};
+```
+
+---
+
+## 3. Lock-free comms between non-RT and RT
+
+A mutex shared by a low-priority non-RT thread and a high-priority RT thread causes
+**priority inversion**: the RT thread blocks on a preempted holder and misses its
+deadline. Hand data across with `realtime_tools` instead.
+
+```cpp
+#include <realtime_tools/realtime_buffer.hpp>
+#include <realtime_tools/realtime_publisher.hpp>
+
+realtime_tools::RealtimeBuffer<Command> rt_command_buffer_;     // SPSC double buffer
+
+void commandCallback(const CommandMsg & msg) {                  // non-RT
+  rt_command_buffer_.writeFromNonRT(toCommand(msg));            // never blocks RT reader
+}
+const Command cmd = *rt_command_buffer_.readFromRT();           // RT
+
+// Publish telemetry FROM the RT path without blocking on the DDS write:
+realtime_tools::RealtimePublisher<StateMsg> rt_pub_{pub};
+if (rt_pub_.trylock()) {           // non-blocking; skip this cycle if held
+  rt_pub_.msg_.effort = effort_[0];
+  rt_pub_.unlockAndPublish();      // handed to a separate non-RT publish thread
+}
+```
+
+- `RealtimeBuffer` / `RealtimeBox` for single-value handoff; an SPSC lock-free queue for
+  streams. Use `std::atomic<T>` (correct memory order) only for trivially-copyable POD.
+- Never `lock()` a `RealtimePublisher` on the RT path — `trylock()` and drop the sample.
+  A lost telemetry sample is fine; a missed control deadline is not.
+
+---
+
+## 4. Determinism: bounded WCET and OS config
+
+Configure the process/threads once at startup, off the RT path.
+
+```cpp
+#include <sys/mman.h>
+#include <pthread.h>
+#include <sched.h>
+
+void setupRealtimeThread(std::size_t cpu) {
+  mlockall(MCL_CURRENT | MCL_FUTURE);            // no page-fault stalls
+
+  sched_param sp{};                              // SCHED_FIFO, high but not max prio
+  sp.sched_priority = 80;                        // stay below kernel watchdog/migration
+  pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
+
+  cpu_set_t set; CPU_ZERO(&set); CPU_SET(cpu, &set);   // pin to an isolated CPU
+  pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+}
+```
+
+- **Bound every loop** at compile time or by known capacity — no unbounded producers.
+- **No dynamic-dispatch surprises**: a `virtual` call is one indirection (fine); a
+  reassignable `std::function` is not. Keep hierarchies shallow.
+- **`mlockall` + pre-fault**: touch/`reserve` all buffers at startup so the first RT
+  cycle is not the one faulting pages in.
+- **Pin & isolate**: `SCHED_FIFO`, CPU affinity, `isolcpus`/`nohz_full`, `performance`
+  governor, disabled deep C-states on the RT core.
+- If you genuinely must share an RT lock, use a `PTHREAD_PRIO_INHERIT` mutex — but
+  redesign to lock-free first. Run `PREEMPT_RT` and measure jitter with `cyclictest`
+  before trusting the loop.
+
+---
+
+## 5. Move semantics, RAII, zero-copy
+
+Hidden copies are both a throughput and an allocation hazard. Make data flow explicit.
+
+```cpp
+void planFrom(const TrajectoryMsg & traj);   // GOOD — pass large objects by const ref
+void planFrom(TrajectoryMsg traj);           // BAD  — copies the whole trajectory
+
+buffer_.push_back(std::move(point));         // transfer ownership, no deep copy
+
+State computeState() { State s; /* ... */ return s; }   // RVO: no copy, no move (C++17)
+```
+
+```cpp
+#include <Eigen/Dense>
+Eigen::Matrix<double, 6, 1> wrench;          // GOOD: fixed-size, stack, vectorizable
+// Eigen::VectorXd dyn;                       // BAD on RT: heap, size-dependent
+result.noalias() = jacobian * joint_vel;     // noalias() avoids a hidden temporary
+```
+
+- Every resource (file, socket, lock, device handle) is owned by an RAII object —
+  acquire off-path, hold across the loop, release on deactivate.
+- Beware Eigen alignment: a fixed-size Eigen member of a heap-allocated class needs
+  `EIGEN_MAKE_ALIGNED_OPERATOR_NEW` (or C++17 aligned `new`) to avoid misaligned SIMD.
+
+---
+
+## 6. Cache and data layout
+
+Once allocation and locking are gone, memory access patterns dominate. Design for the
+cache, not for OOP aesthetics.
+
+```cpp
+// BAD: array-of-structs — iterating one field pulls unrelated fields + heap into cache.
+struct Joint { double pos, vel, eff, temp; std::string name; };
+std::array<Joint, kNumJoints> joints;
+
+// GOOD: struct-of-arrays — the loop streams contiguous, SIMD-friendly hot fields.
+struct JointState {
+  std::array<double, kNumJoints> position;
+  std::array<double, kNumJoints> velocity;
+  std::array<double, kNumJoints> effort;
+};
+
+// Prevent false sharing: independently-written atomics get their own cache line.
+struct alignas(64) Counter { std::atomic<std::uint64_t> value; };
+Counter rt_cycles, io_cycles;
+```
+
+- **Data-oriented design**: hot data contiguous, iterated linearly so the prefetcher
+  works. **Struct-of-arrays** for per-joint state streamed each cycle.
+- **`alignas(64)`** (cache-line size) to isolate independently-written atomics.
+- **Hot/cold splitting**: keep names, diagnostics, and config in a separate cold struct
+  so they do not evict hot data.
+
+---
+
+## Sourced references
+
+<!-- trellis:managed:rt-sources START -->
+Authoritative real-time / performance sources are refreshed here by
+`python3 .trellis/scripts/import_spec.py` (ROS 2 real-time working group, `ros2_control`
+and `realtime_tools` docs, OSRF real-time guidance). Run the importer to populate this
+region with current links and provenance. Edit outside the managed markers only.
+<!-- trellis:managed:rt-sources END -->
+
+---
+
+## Bare-metal / RTOS profile
+
+When the loop runs on an MCU or RTOS (Zephyr, FreeRTOS, NuttX, bare-metal) the
+constraints tighten:
+
+- **No exceptions, no RTTI**: build `-fno-exceptions -fno-rtti`; report errors via return
+  codes / result types, never `throw`.
+- **Static allocation only**: no `new`/`malloc`. Static objects or pre-sized pools; trap
+  stray heap calls (`-Wl,--wrap=malloc`).
+- **`-ffreestanding`**: no hosted libc assumptions; avoid `<iostream>`, locale, heavy
+  headers.
+- **ISR constraints**: handlers are short and non-blocking — set a flag or push to an
+  SPSC ring, never compute/allocate; minimize the critical section.
+- **No FPU? fixed-point**: software floats are slow and non-deterministic; use Q-format.
+- **Bounded stack**: size each task's stack explicitly; no recursion, no large stack
+  arrays; measure high-water marks.
+
+```cpp
+using q16 = std::int32_t;                                   // Q16.16 fixed-point
+constexpr q16 toQ16(double x) { return static_cast<q16>(x * 65536.0); }
+constexpr q16 mulQ16(q16 a, q16 b) {
+  return static_cast<q16>((static_cast<std::int64_t>(a) * b) >> 16);
+}
+```
+
+---
+
+## Forbidden on the real-time path
+
+- Heap: `new`/`delete`/`malloc`/`free`, `std::vector` growth, `std::string`,
+  `std::map`/`std::unordered_map` insert.
+- `std::function` construction/assignment; captures that heap-allocate.
+- `std::shared_ptr`/`std::weak_ptr` copy or destruction (atomic refcount + free).
+- Mutexes/spinlocks shared with non-RT threads (priority inversion); blocking
+  `lock()` on a `RealtimePublisher`.
+- `throw` / exceptions / stack unwinding; `dynamic_cast` / RTTI.
+- Any syscall or I/O: file, socket, `std::cout`, `printf`, `RCLCPP_INFO`.
+- Unbounded loops/recursion or iteration counts driven by runtime data.
+- `sleep`, `std::this_thread::yield`, condition-variable waits, any blocking call.
+- Dynamic-size Eigen types (`VectorXd`, `MatrixXd`) and ops that allocate temporaries.
+
+---
+
+**Language**: All documentation should be written in **English**.

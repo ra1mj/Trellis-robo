@@ -1,0 +1,168 @@
+# Reinforcement Learning for Robotics
+
+> Conventions for training, exporting, and deploying RL policies on a ROS 2 robot.
+> RL is an orthogonal capability stack: a mobile, manipulator, or legged robot may
+> run a learned policy alongside its classical controllers.
+
+---
+
+## Overview
+
+A learned policy is just another controller in the stack. Treat training and
+deployment as two disciplines: training in simulation (Python, GPU, non-real-time),
+deployment inside a ROS 2 node (C++, on the robot, under the control-loop budget).
+The contract between them is a frozen, versioned artifact (ONNX / TorchScript) plus
+an exact spec of its observation and action spaces.
+
+Hard rule: **the policy step must never block the real-time control path**. See
+[C++ Performance](../../cpp-performance.md) for the RT-loop constraints this domain
+inherits.
+
+---
+
+## Training & simulation stacks
+
+| Stack | Use it for |
+|-------|-----------|
+| Isaac Lab (Isaac Sim) | GPU-parallel locomotion / manipulation, thousands of envs, photoreal sensors |
+| Gymnasium + MuJoCo | Fast prototyping, reproducible benchmarks, contact-rich tasks |
+| SB3 / RSL-RL / rl_games | Algorithm implementations (PPO, SAC) on the above envs |
+
+Pin versions and record the exact env + algorithm config next to the exported
+policy. A policy with no recorded training config is not reproducible and must not
+be deployed.
+
+---
+
+## Observation & action conventions
+
+- **Freeze the layout.** Observation order, units, and scaling are a contract.
+  Serialize them to a YAML shipped with the policy so the C++ node assembles the
+  identical vector. A reordered observation is a silent, catastrophic bug.
+- **Normalize consistently.** Export training normalization stats (running mean/
+  std) and apply them identically at inference; never re-estimate online.
+- **Frames & units follow [Dynamics](../../dynamics.md)** (REP-103: x forward,
+  y left, z up; SI). Velocities are body-frame unless documented otherwise.
+- **Actions are explicit.** Document whether the action is an absolute target, a
+  delta from a default pose, or a torque, plus its units — and re-apply the same
+  scale/offset at deploy time.
+
+```yaml
+# policy_v3.layout.yaml — ONE source of truth for env and deploy node
+control_dt: 0.02            # 50 Hz policy rate, must match the deploy node
+obs: [base_lin_vel:3, base_ang_vel:3, projected_gravity:3,
+      commands:3, joint_pos:12, joint_vel:12, last_action:12]
+act: {joint_pos_targets: 12}   # rad, added to the default pose
+```
+
+---
+
+## Reward shaping discipline
+
+Keep the reward in one file; name and log every term separately (you cannot debug a
+scalar). Prefer a few physically meaningful terms over many hand-tuned penalties —
+heavy shaping is the main source of reward hacking. Penalize what hardware cannot
+allow (joint/torque limits, action rate, foot slip) so the behavior is already safe.
+
+```python
+def compute_reward(self):
+    track = torch.exp(-4.0 * (self.cmd_vel - self.base_vel).square().sum(-1))
+    torque_pen = -2e-4 * self.torques.square().sum(-1)
+    act_rate_pen = -0.01 * (self.action - self.last_action).square().sum(-1)
+    self.log("reward/tracking", track)       # log each term, not just the sum
+    self.log("reward/torque", torque_pen)
+    return track + torque_pen + act_rate_pen
+```
+
+---
+
+## Domain randomization for sim2real
+
+Randomize what differs between sim and reality: mass/inertia, friction, motor
+strength and latency, sensor noise and delay, and an action-latency model. Small
+action noise keeps the policy from depending on perfectly clean control.
+
+```yaml
+randomization:
+  body_mass:      {op: scale, range: [0.8, 1.2]}
+  friction:       {op: set,   range: [0.4, 1.2]}
+  motor_strength: {op: scale, range: [0.9, 1.1]}
+  action_latency: {steps: [0, 2]}     # model controller delay
+```
+
+---
+
+## Policy export & C++ inference
+
+Export the frozen policy to ONNX (preferred for portable C++) or TorchScript;
+load it with ONNX Runtime / LibTorch inside the ROS 2 node. Version the artifact
+and the layout YAML together, and round-trip-verify the export before shipping.
+
+```python
+policy.eval()                                  # no dropout / stochastic layers
+torch.onnx.export(policy, torch.zeros(1, OBS_DIM), "policy_v3.onnx",
+                  input_names=["obs"], output_names=["action"], opset_version=17)
+```
+
+```cpp
+// rl_policy_node.cpp — allocate the session and IO tensors ONCE in on_configure(),
+// never in update() (see ../../cpp-performance.md — no heap on the RT path).
+Ort::Session session_{env_, "policy_v3.onnx", session_opts_};
+
+void RlController::update(const rclcpp::Time &) {
+  assemble_observation(obs_buf_);              // fixed-size, pre-normalized
+  session_.Run(run_opts_, in_names_, &obs_value_, 1, out_names_, &act_value_, 1);
+  clamp_and_write(act_buf_);                   // safety wrap, then command
+}
+```
+
+If inference cannot meet the loop budget on the target hardware, run it in a
+separate lower-rate thread/node and hand the latest action to the RT controller
+through a lock-free buffer — never make the RT loop wait on inference.
+
+---
+
+## Real-time inference & determinism
+
+- The policy step must fit inside the control period (e.g. 20 ms at 50 Hz) with
+  margin; measure it on the target hardware, not a workstation.
+- No heap, no locks, no exceptions on the inference path — pre-allocate ORT tensors
+  and the obs/action buffers. Pin and prioritize the thread if it runs in the loop.
+- Seed env + RNG + framework and record the seed with the artifact. Deploy with
+  deterministic action selection (the policy mean, not a sampled action).
+
+---
+
+## Safety wrapping
+
+Never command a raw network output to hardware — wrap every action:
+
+```cpp
+double cmd = std::clamp(raw, joint_min_[i], joint_max_[i]);   // limits first
+cmd = rate_limit(cmd, prev_cmd_[i], max_rate_ * dt);          // then rate-limit
+if (!std::isfinite(raw) || policy_stale(now))                 // stale/NaN guard
+  cmd = fallback_controller_.command(i);                      // deterministic fallback
+```
+
+Clamp to joint/velocity/torque limits, detect stale/NaN/out-of-range output and
+switch to a deterministic fallback (hold pose, damped stop, classical controller),
+and keep an independent E-stop the policy cannot override.
+
+---
+
+## Common mistakes
+
+- **Sim2real gap ignored.** No domain randomization or latency model — works in
+  sim, falls over on hardware. Randomize and model latency.
+- **Reward hacking.** Over-shaped reward lets the policy exploit the simulator.
+  Keep the reward minimal and log every term.
+- **Blocking inference on the RT path.** Synchronous ONNX/LibTorch in the control
+  loop, per-step tensor allocation, missed deadlines. Pre-allocate, measure, decouple.
+- **Unbounded actions.** Commanding the raw output with no clamp, rate limit, or
+  fallback. Always wrap actions in a safety layer.
+- **Observation drift.** The C++ node builds observations in a different order /
+  scale / frame than training. Ship the layout as a contract and load it.
+
+---
+
+**Language**: All documentation should be written in **English**.

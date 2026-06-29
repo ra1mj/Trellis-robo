@@ -1,0 +1,180 @@
+# Vision-Language-Action (VLA) for Robotics
+
+> Conventions for integrating a vision-language-action model into a ROS 2 robot.
+> The VLA is a slow, high-level policy: it runs at a few Hz on a GPU and feeds a
+> fast low-level controller. It must never sit inline with the real-time loop.
+
+---
+
+## Overview
+
+A VLA model (OpenVLA-style: a vision-language backbone fine-tuned to output robot
+actions) closes a **perception → language → action** loop. It takes an image (or
+several camera views) plus a natural-language instruction and emits an action, or a
+short chunk of future actions.
+
+The defining fact: the VLA is **slow** (tens to hundreds of ms per inference) and
+the control loop is **fast** (hundreds of Hz). They run at different rates, in
+different processes, and communicate through a published action chunk. The slow loop
+sets intent; the fast loop tracks it and owns safety. See
+[C++ Performance](../../cpp-performance.md) for the RT-loop rules the low-level
+controller inherits.
+
+---
+
+## VLA stack overview
+
+```
+camera(s) ──► [GPU serving node]  image + instruction ──► VLA model ──► action chunk
+                     │ async, batched, few Hz                              │
+instruction ─────────┘                                                     ▼
+                                                       [low-level controller, RT]
+                                                        interpolate + track + safety
+```
+
+- **VLA serving node** (Python, GPU): owns the model, runs inference, publishes
+  action chunks; decoupled from the control loop.
+- **Low-level controller** (C++, RT): receives chunks, interpolates to its own
+  rate, enforces limits, owns safety / fallback.
+- **Instruction source**: a UI, task planner, or fixed config; the current
+  instruction is part of the observation contract.
+
+---
+
+## Perception → language → action loop
+
+- Camera frames and the instruction enter the serving node; preprocessing (resize,
+  normalize, tokenize) must match the model's training pipeline exactly.
+- The model emits actions in a documented space (end-effector delta pose, gripper
+  command, or joint targets); define frame and units per
+  [Dynamics](../../dynamics.md) (REP-103).
+- Most VLAs predict an **action chunk** (e.g. the next 8 steps). Publish the whole
+  chunk and re-plan before it runs out, so a missed inference never starves the
+  controller.
+
+---
+
+## Serving: decouple from the control loop
+
+Run the model in its own GPU process, asynchronously, optionally batched. The
+control loop never calls the model — it only reads the latest published chunk.
+
+```python
+# vla_server_node.py — async serving, no synchronous coupling to control.
+class VlaServer(Node):
+    def __init__(self):
+        super().__init__("vla_server")
+        self.model = load_vla("openvla-7b").to("cuda").eval()
+        self.create_subscription(Image, "/camera/rgb", self._on_image, 1)  # depth 1: drop stale
+        self.pub = self.create_publisher(ActionChunk, "/vla/action_chunk", 1)
+        self.create_timer(0.2, self._infer)        # 5 Hz inference budget
+
+    @torch.inference_mode()
+    def _infer(self):
+        if self.latest is None:
+            return
+        obs = self.preprocess(self.latest, self.instruction)
+        chunk = self.model.predict_action(obs)      # (horizon, action_dim)
+        self.pub.publish(to_action_chunk(chunk, stamp=self.get_clock().now()))
+```
+
+Use `torch.inference_mode()`, FP16/BF16 or a quantized/compiled model, and a warmup
+inference at startup so the first request is not a multi-second stall. Drop stale
+frames (queue depth 1) instead of building a backlog.
+
+---
+
+## Latency budgets
+
+| Loop | Rate | Owns |
+|------|------|------|
+| VLA serving | 1–10 Hz | Intent: what to do next (action chunk) |
+| Low-level controller | 200 Hz–1 kHz | Tracking + safety, real-time |
+
+- Size the chunk to cover more than one inference period: if inference is 200 ms and
+  the controller runs at 500 Hz, the chunk must provide well over 100 steps of runway
+  so the controller never runs dry between updates.
+- Budget end-to-end latency (capture → preprocess → inference → publish → controller)
+  and measure it on target hardware. A blown budget is a safety event, not a nit.
+
+---
+
+## Input / output contracts
+
+Define the message contract explicitly and version it:
+
+```yaml
+# ActionChunk.msg — document units, frame, and order
+header:       std_msgs/Header   # stamp = inference time, for staleness checks
+instruction:  string            # the instruction this chunk was produced for
+control_dt:   float64           # seconds between chunk steps
+actions:      float64[]         # flattened (horizon x action_dim)
+# action_dim layout: [dx, dy, dz, drx, dry, drz, gripper]  (EE-frame deltas, m / rad)
+```
+
+The controller reads `header.stamp` to detect a stale chunk and `control_dt` to
+interpolate to its own rate. Image and instruction preprocessing must be
+byte-for-byte consistent with training — a mismatched resize or normalization
+silently degrades the policy.
+
+---
+
+## Safety gating, HITL, and OOD detection
+
+The slow VLA loop cannot react to faults — the **fast controller owns safety**:
+
+```cpp
+// low_level_controller.cpp — the RT side that consumes VLA chunks.
+void Controller::update(const rclcpp::Time &now) {
+  if (chunk_age(now) > kMaxChunkAge || !chunk_valid_) { safe_stop(); return; }  // stale/invalid
+  auto target = clamp_to_workspace(interpolate(chunk_, now));  // model output is advisory
+  target = rate_limit(target);
+  if (!hitl_armed_) { safe_stop(); return; }                   // human-in-the-loop gate
+  command(target);
+}
+```
+
+- **Staleness gate**: if the latest chunk is too old, stop / hold — never replay a
+  stale plan.
+- **Workspace / limit gate**: clamp every commanded target to a safe set (workspace
+  bounds, joint limits, max speed).
+- **OOD detection**: flag inputs unlike training (novel scene, unseen instruction,
+  low action confidence / high entropy) and fall back to hold or a human.
+- **Human-in-the-loop**: keep an arm/disarm and an independent E-stop the model
+  cannot override.
+
+---
+
+## Slow VLA → fast controller handoff
+
+The serving node publishes intent; the controller realizes it in real time:
+
+1. VLA publishes an action chunk with a timestamp and `control_dt`.
+2. The controller interpolates the chunk to its own (much higher) rate.
+3. Each step is clamped, rate-limited, and safety-gated before commanding.
+4. The controller keeps tracking the current chunk until a fresher one arrives; if
+   none arrives in time, it fails safe rather than extrapolating blindly.
+
+This boundary is the whole design: the model is allowed to be slow and occasionally
+wrong because the fast loop bounds and supervises it.
+
+---
+
+## Common mistakes
+
+- **Running VLA inline with control.** Calling the model from the control loop blocks
+  it for tens to hundreds of ms and misses every deadline. Serve asynchronously and
+  consume published chunks.
+- **No safety gate.** Commanding VLA output directly with no clamp, staleness check,
+  or E-stop. The fast controller must own limits and fallback.
+- **Latency stalls.** No warmup, unbounded queues, FP32 on a too-small GPU →
+  inference backs up and the controller starves. Warmup, drop stale frames, quantize,
+  size chunks to cover the inference period.
+- **Ignoring OOD.** Trusting confident-looking actions on inputs unlike training.
+  Detect OOD and degrade to hold / human.
+- **Contract drift.** Preprocessing or action layout differs from training, or the
+  message frame/units are undocumented. Pin and version the I/O contract.
+
+---
+
+**Language**: All documentation should be written in **English**.

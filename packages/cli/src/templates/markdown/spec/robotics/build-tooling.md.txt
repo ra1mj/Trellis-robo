@@ -1,0 +1,208 @@
+# Build & Tooling
+
+> Package layout, CMake, colcon, testing, and CI for C++ on ROS 2. `ament_cmake` is the
+> build system; C++17 is the baseline (C++20 on ROS 2 Rolling).
+
+---
+
+## Overview
+
+This is how a ROS 2 C++ package is structured, built, tested, and linted. Following it
+means `colcon build` and `colcon test` work the same on every machine and in CI, and the
+ament linters pass without surprises. Targets — not loose variables — are the unit of
+configuration: dependencies, include paths, and compile options attach to targets.
+
+---
+
+## Package layout
+
+A standard `ament_cmake` package:
+
+```text
+my_robot_controller/
+├── package.xml                              # manifest: deps, license, maintainer
+├── CMakeLists.txt                           # build definition
+├── include/my_robot_controller/             # installed public headers
+│   └── diff_drive_controller.hpp
+├── src/                                      # implementation + private headers
+│   └── diff_drive_controller.cpp
+└── test/                                     # unit + integration tests
+    ├── test_kinematics.cpp
+    └── test_controller_launch.py            # launch_testing integration test
+```
+
+`package.xml` declares build and runtime dependencies (resolved by `rosdep`):
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+  <name>my_robot_controller</name>
+  <version>0.1.0</version>
+  <description>Differential-drive controller.</description>
+  <maintainer email="dev@example.com">Robotics Team</maintainer>
+  <license>Apache-2.0</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <depend>rclcpp</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+
+  <test_depend>ament_cmake_gtest</test_depend>
+  <test_depend>ament_lint_auto</test_depend>
+  <test_depend>ament_lint_common</test_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>
+```
+
+## CMakeLists.txt
+
+Target-based, with the standard ament find/build/install/export shape:
+
+```cmake
+cmake_minimum_required(VERSION 3.16)
+project(my_robot_controller)
+
+# C++17 baseline (C++20 is available on ROS 2 Rolling — bump CMAKE_CXX_STANDARD to 20 there).
+if(NOT CMAKE_CXX_STANDARD)
+  set(CMAKE_CXX_STANDARD 17)
+endif()
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Warnings: strict everywhere, error-on-warning only in CI (-DTREAT_WARNINGS_AS_ERRORS=ON).
+if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+  add_compile_options(-Wall -Wextra -Wpedantic)
+  if(TREAT_WARNINGS_AS_ERRORS)
+    add_compile_options(-Werror)
+  endif()
+endif()
+
+find_package(ament_cmake REQUIRED)
+find_package(rclcpp REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
+
+add_library(${PROJECT_NAME} src/diff_drive_controller.cpp)
+
+target_include_directories(${PROJECT_NAME} PUBLIC
+  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+  "$<INSTALL_INTERFACE:include>")
+
+ament_target_dependencies(${PROJECT_NAME}
+  rclcpp geometry_msgs nav_msgs)
+
+install(DIRECTORY include/ DESTINATION include)
+install(TARGETS ${PROJECT_NAME}
+  EXPORT export_${PROJECT_NAME}
+  ARCHIVE DESTINATION lib
+  LIBRARY DESTINATION lib
+  RUNTIME DESTINATION bin)
+
+ament_export_targets(export_${PROJECT_NAME} HAS_LIBRARY_TARGET)
+ament_export_dependencies(rclcpp geometry_msgs nav_msgs)
+```
+
+`ament_target_dependencies` is preferred over a bare `target_link_libraries` for ROS
+packages — it wires include dirs, link libs, and transitive deps from the `find_package`
+results. Export targets and dependencies so downstream packages can consume the library.
+
+## colcon workspace
+
+Build and run from the workspace root (the directory containing `src/`):
+
+```bash
+# Build one package (and its deps); symlink-install speeds up Python/launch iteration.
+colcon build --packages-up-to my_robot_controller --symlink-install
+
+# Source the overlay, then run.
+source install/setup.bash
+
+# Build with warnings-as-errors for a CI-equivalent local check.
+colcon build --packages-select my_robot_controller \
+  --cmake-args -DTREAT_WARNINGS_AS_ERRORS=ON
+```
+
+## Testing
+
+Unit tests use `ament_cmake_gtest`; linters run via `ament_lint_auto`. Add to
+`CMakeLists.txt` under a `BUILD_TESTING` guard:
+
+```cmake
+if(BUILD_TESTING)
+  find_package(ament_lint_auto REQUIRED)
+  ament_lint_auto_find_test_dependencies()  # runs clang-format, clang-tidy, cpplint, etc.
+
+  find_package(ament_cmake_gtest REQUIRED)
+  ament_add_gtest(test_kinematics test/test_kinematics.cpp)
+  target_link_libraries(test_kinematics ${PROJECT_NAME})
+
+  # Integration test driving real nodes.
+  find_package(launch_testing_ament_cmake REQUIRED)
+  add_launch_test(test/test_controller_launch.py)
+endif()
+```
+
+Run the suite (linters + gtest + launch_testing) and inspect output:
+
+```bash
+colcon test --packages-select my_robot_controller --event-handlers console_direct+
+colcon test-result --all --verbose   # non-zero exit if any test failed
+```
+
+- `ament_cmake_gtest` — fast, isolated unit tests for kinematics, math, and pure logic.
+- `launch_testing` — integration tests that launch nodes and assert on topics/services,
+  the right place to test a controller end to end.
+
+## Sanitizers
+
+Build non-RT test binaries with sanitizers to catch memory and undefined behavior. Do not
+ship sanitizer builds to the robot — they add latency and allocate, breaking RT timing.
+
+```bash
+# AddressSanitizer + UndefinedBehaviorSanitizer for unit tests.
+colcon build --packages-select my_robot_controller \
+  --cmake-args -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+# ThreadSanitizer (separate build — incompatible with ASan) for concurrency checks.
+colcon build --packages-select my_robot_controller \
+  --cmake-args -DCMAKE_CXX_FLAGS="-fsanitize=thread"
+```
+
+## CI
+
+CI builds clean, runs the full test+lint suite with warnings as errors, and fails on any
+test-result error. A minimal pipeline:
+
+```bash
+rosdep install --from-paths src --ignore-src -y          # resolve deps
+colcon build --cmake-args -DTREAT_WARNINGS_AS_ERRORS=ON  # strict build
+colcon test --event-handlers console_direct+             # gtest + ament_lint
+colcon test-result --all --verbose                       # propagate failures
+```
+
+The `industrial_ci` GitHub Action wraps this for ROS 2 distros if you prefer a maintained
+action over a hand-rolled script.
+
+---
+
+## Common mistakes
+
+- Using bare CMake variables (`include_directories`, global `link_libraries`) instead of
+  target-based commands — breaks export and pollutes unrelated targets.
+- Forgetting `BUILD_TESTING` guard around test/lint blocks — slows release builds and pulls
+  test deps into runtime.
+- Skipping `ament_lint_auto_find_test_dependencies()` — clang-format / clang-tidy never run,
+  so style regressions land silently.
+- Omitting `ament_export_targets` / `ament_export_dependencies` — downstream packages fail
+  to find the library or its transitive deps.
+- Running sanitizers (ASan/UBSan/TSan) on RT control binaries — they allocate and add
+  latency; reserve them for non-RT unit tests.
+- Hardcoding `CMAKE_CXX_STANDARD` to 17 unconditionally — guard it so Rolling builds can opt
+  into C++20.
+
+---
+
+**Language**: All documentation should be written in **English**.

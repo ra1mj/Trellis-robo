@@ -59,6 +59,26 @@ let cachedSkills: CommonTemplate[] | undefined;
 let cachedBundledSkills: CommonBundledSkill[] | undefined;
 
 /**
+ * Bundled skills that only ship when a project opts into robotics (ROS 2 / C++).
+ * They live under `bundled-skills/` like any other bundled skill, but are gated
+ * out of the default set so non-robotics projects don't get ROS 2 skills.
+ */
+export const ROBOTICS_BUNDLED_SKILLS: ReadonlySet<string> = new Set([
+  "ros2-control",
+  "ros2-nav2",
+  "ros2-moveit2",
+]);
+
+// Install-time context flag, mirroring setResolvedPythonCommand: set once per
+// `trellis init`/`update` run before configurators resolve bundled skills.
+let roboticsSkillsEnabled = false;
+
+/** Include robotics bundled skills in `getBundledSkillTemplates()` output. */
+export function setRoboticsSkillsEnabled(value: boolean): void {
+  roboticsSkillsEnabled = value;
+}
+
+/**
  * Get all command templates (stay as slash commands on all platforms).
  * Results are cached after first call.
  */
@@ -130,5 +150,9 @@ export function getBundledSkillTemplates(): CommonBundledSkill[] {
     name,
     files: listBundledSkillFiles(name),
   }));
-  return cachedBundledSkills;
+  // Robotics skills are gated: only included when the install run opted into
+  // robotics (set via setRoboticsSkillsEnabled). The cache stays the full list.
+  return roboticsSkillsEnabled
+    ? cachedBundledSkills
+    : cachedBundledSkills.filter((s) => !ROBOTICS_BUNDLED_SKILLS.has(s.name));
 }

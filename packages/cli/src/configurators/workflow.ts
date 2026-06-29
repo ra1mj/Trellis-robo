@@ -1,7 +1,7 @@
 import path from "node:path";
 
 import { DIR_NAMES, PATHS } from "../constants/paths.js";
-import { copyTrellisDir } from "../templates/extract.js";
+import { copyTrellisDir, readTrellisFile } from "../templates/extract.js";
 
 // Import trellis templates (generic, not project-specific)
 import {
@@ -33,7 +33,10 @@ import {
   guidesIndexContent,
   guidesCrossLayerThinkingGuideContent,
   guidesCodeReuseThinkingGuideContent,
+  getRoboticsCoreDocs,
+  getRoboticsDomainDoc,
 } from "../templates/markdown/index.js";
+import type { RoboticsDomain } from "../utils/robotics.js";
 
 import { writeFile, ensureDir } from "../utils/file-writer.js";
 import { replacePythonCommandLiterals } from "./shared.js";
@@ -60,6 +63,13 @@ export interface WorkflowOptions {
   packages?: DetectedPackage[];
   /** Package names that use remote templates (skip blank spec for these) */
   remoteSpecPackages?: Set<string>;
+  /**
+   * Robotics domains selected via `trellis init --robotics`. When defined
+   * (even as an empty array) the robotics spec pack is scaffolded: core docs
+   * always, plus one `domains/<id>/` dir per selected domain. Undefined = not a
+   * robotics project, write nothing under `.trellis/spec/robotics/`.
+   */
+  roboticsDomains?: RoboticsDomain[];
   /**
    * Optional override for `.trellis/workflow.md` content. When omitted the
    * bundled native template is written. Set by `init --workflow` (or
@@ -148,6 +158,43 @@ export async function createWorkflowStructure(
   } else if (!skipSpecTemplates) {
     // Single-repo mode: create global spec (skip if using remote template)
     await createSpecTemplates(cwd, projectType);
+  }
+
+  // Robotics spec pack (opt-in via --robotics). Independent of project type and
+  // monorepo/remote mode — robotics specs live under .trellis/spec/robotics/.
+  if (options?.roboticsDomains) {
+    await createRoboticsSpecTemplates(cwd, options.roboticsDomains);
+  }
+}
+
+/**
+ * Scaffold the C++ / ROS 2 robotics spec pack. Always writes the core docs;
+ * writes one `domains/<id>/index.md` per selected domain.
+ */
+export async function createRoboticsSpecTemplates(
+  cwd: string,
+  domains: RoboticsDomain[],
+): Promise<void> {
+  const roboticsBase = path.join(cwd, `${PATHS.SPEC}/robotics`);
+  ensureDir(roboticsBase);
+
+  for (const doc of getRoboticsCoreDocs()) {
+    await writeFile(path.join(roboticsBase, doc.name), doc.content);
+  }
+
+  // Ship the scraper source registry so `import_spec.py` works out of the box.
+  await writeFile(
+    path.join(cwd, DIR_NAMES.WORKFLOW, "spec-sources.json"),
+    readTrellisFile("spec-sources.json"),
+  );
+
+  for (const domain of domains) {
+    const domainDir = path.join(roboticsBase, "domains", domain);
+    ensureDir(domainDir);
+    await writeFile(
+      path.join(domainDir, "index.md"),
+      getRoboticsDomainDoc(domain),
+    );
   }
 }
 

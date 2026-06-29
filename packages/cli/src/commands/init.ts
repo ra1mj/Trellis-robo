@@ -7,6 +7,12 @@ import figlet from "figlet";
 import inquirer from "inquirer";
 import { createWorkflowStructure } from "../configurators/workflow.js";
 import {
+  ROBOTICS_DOMAINS,
+  parseRoboticsDomains,
+  type RoboticsDomain,
+} from "../utils/robotics.js";
+import { setRoboticsSkillsEnabled } from "../templates/common/index.js";
+import {
   getInitToolChoices,
   resolveCliFlag,
   configurePlatform,
@@ -1034,6 +1040,10 @@ interface InitOptions {
   withStatusline?: boolean;
   workflow?: string;
   workflowSource?: string;
+  /** Enable the robotics (ROS 2 / C++) spec pack. */
+  robotics?: boolean;
+  /** Robotics domains to scaffold (mobile/manipulator/legged/rl/vla). */
+  robotDomain?: string[];
 }
 
 // Compile-time check: every CliFlag must be a key of InitOptions.
@@ -1087,6 +1097,95 @@ function writeMonorepoConfig(cwd: string, packages: DetectedPackage[]): void {
     content.trimEnd() + "\n" + lines.join("\n") + "\n",
     "utf-8",
   );
+}
+
+/**
+ * Write the robotics profile to config.yaml (non-destructive patch), mirroring
+ * writeMonorepoConfig. Records `robotics.enabled` + selected domains so hooks and
+ * tooling can read that this is a robotics project.
+ */
+function writeRoboticsConfig(cwd: string, domains: RoboticsDomain[]): void {
+  const configPath = path.join(cwd, DIR_NAMES.WORKFLOW, "config.yaml");
+  let content = "";
+  try {
+    content = fs.readFileSync(configPath, "utf-8");
+  } catch {
+    return;
+  }
+  // Don't overwrite an existing robotics block (re-init case).
+  if (/^robotics\s*:/m.test(content)) {
+    return;
+  }
+  const lines = [
+    "\n# Robotics profile (trellis init --robotics)",
+    "robotics:",
+    "  enabled: true",
+    `  domains: [${domains.join(", ")}]`,
+  ];
+  fs.writeFileSync(
+    configPath,
+    content.trimEnd() + "\n" + lines.join("\n") + "\n",
+    "utf-8",
+  );
+}
+
+/**
+ * Resolve the robotics domain selection for this init run.
+ *
+ * Returns `undefined` when robotics is not requested (non-robotics project —
+ * nothing under .trellis/spec/robotics/ is written). Returns an array (possibly
+ * empty = core docs only) when robotics is enabled via flag, `--robot-domain`,
+ * or the interactive opt-in.
+ */
+async function resolveRoboticsDomains(
+  options: InitOptions,
+  interactive: boolean,
+): Promise<RoboticsDomain[] | undefined> {
+  // Non-interactive / flag-driven path.
+  if (options.robotDomain && options.robotDomain.length > 0) {
+    const { domains, unknown } = parseRoboticsDomains(options.robotDomain);
+    if (unknown.length > 0) {
+      console.log(
+        chalk.yellow(
+          `⚠️  Ignoring unknown robot domain(s): ${unknown.join(", ")}`,
+        ),
+      );
+    }
+    return domains;
+  }
+  if (options.robotics && !interactive) {
+    // --robotics with no domains and no prompt: core docs only.
+    return [];
+  }
+  if (!interactive) {
+    return undefined;
+  }
+
+  // Interactive opt-in.
+  const enablePrompt = options.robotics
+    ? { robotics: true }
+    : await inquirer.prompt<{ robotics: boolean }>([
+        {
+          type: "confirm",
+          name: "robotics",
+          message: "Is this a robotics (ROS 2 / C++) project?",
+          default: false,
+        },
+      ]);
+  if (!enablePrompt.robotics) {
+    return undefined;
+  }
+
+  const { domains } = await inquirer.prompt<{ domains: RoboticsDomain[] }>([
+    {
+      type: "checkbox",
+      name: "domains",
+      message:
+        "Select robot domains to scaffold (core C++/ROS 2 specs always included):",
+      choices: ROBOTICS_DOMAINS.map((d) => ({ name: d.label, value: d.id })),
+    },
+  ]);
+  return domains;
 }
 
 interface InitAnswers {
@@ -1896,6 +1995,12 @@ export async function init(options: InitOptions): Promise<void> {
     }
   }
 
+  // Resolve robotics profile (opt-in). Prompted before any file writes so the
+  // interactive questions don't interleave with scaffolding logs.
+  const roboticsDomains = await resolveRoboticsDomains(options, !options.yes);
+  // Gate robotics bundled skills (ros2-*) into the configurators' skill resolution.
+  setRoboticsSkillsEnabled(roboticsDomains != null);
+
   // ==========================================================================
   // Create Workflow Structure
   // ==========================================================================
@@ -1915,12 +2020,23 @@ export async function init(options: InitOptions): Promise<void> {
       packages: monorepoPackages,
       remoteSpecPackages,
       workflowMdOverride,
+      roboticsDomains,
     });
 
     // Write monorepo packages to config.yaml (non-destructive patch)
     if (monorepoPackages) {
       writeMonorepoConfig(cwd, monorepoPackages);
       console.log(chalk.blue("📦 Monorepo packages written to config.yaml"));
+    }
+
+    // Write robotics profile to config.yaml (non-destructive patch)
+    if (roboticsDomains) {
+      writeRoboticsConfig(cwd, roboticsDomains);
+      const domainNote =
+        roboticsDomains.length > 0
+          ? roboticsDomains.join(", ")
+          : "core specs only";
+      console.log(chalk.blue(`🤖 Robotics spec pack written (${domainNote})`));
     }
 
     // Write version file for update tracking

@@ -1,0 +1,234 @@
+# Robot Dynamics Foundations (C++ / Eigen)
+
+> Frame, unit, kinematics, and dynamics conventions shared by every robot type
+> (mobile, manipulator, legged). Get these right once so controllers compose.
+
+---
+
+## Overview
+
+This guideline fixes the math conventions that all robotics code in this project
+relies on: which frames exist, what units they use, how rigid motions and rotations
+are represented in C++ (Eigen + TF2), and how kinematics, Jacobians, and the
+equations of motion are computed. It is morphology-agnostic — a diff-drive base, a
+6-DOF arm, and a quadruped all share these foundations. Domain docs build on top.
+
+The rule of thumb: store SI units and unit quaternions, name every transform by its
+two frames, and lean on a maintained dynamics library instead of re-deriving inertia.
+
+---
+
+## Units & frames (REP-103 / REP-105)
+
+[REP-103](https://www.ros.org/reps/rep-0103.html) is the law: **SI units only** —
+meters, kilograms, seconds, radians, rad/s. Frames are **right-handed**. For a robot
+body frame: **x forward, y left, z up**. Angles are radians everywhere internally;
+convert to/from degrees only at human-facing boundaries (configs, UIs).
+
+Outdoor / geographic poses use **ENU** (East-North-Up) per REP-103. Aerospace stacks
+often use **NED** (North-East-Down) — if you ingest NED sensor data (PX4, some IMUs),
+convert at the boundary; never let NED leak into ROS frames.
+
+[REP-105](https://www.ros.org/reps/rep-0105.html) fixes the mobile frame tree:
+
+```
+earth → map → odom → base_link
+```
+
+- `map`: world-fixed, globally accurate, **may jump** when localization corrects.
+- `odom`: locally smooth and **continuous (no jumps)**, but drifts over time.
+- `base_link`: rigidly attached to the robot base.
+
+Consequence: run **local feedback control in `odom`** (continuous), use `map` only for
+global goals. `odom→base_link` is published by odometry; `map→odom` by localization.
+
+---
+
+## Rigid-body kinematics: SE(3), rotations, Eigen, TF2
+
+Represent a rigid motion as an SE(3) transform `[R t; 0 1]`. In Eigen use
+`Eigen::Isometry3d` (keeps it a proper rigid transform — rotation + translation, no
+scale). Store orientation as a **unit quaternion** (`Eigen::Quaterniond`); prefer it
+over Euler angles, which are ambiguous (order-dependent) and hit gimbal lock.
+
+```cpp
+#include <Eigen/Geometry>
+
+// base_link pose expressed in the odom frame (SI units, REP-103).
+Eigen::Isometry3d T_odom_base = Eigen::Isometry3d::Identity();
+T_odom_base.translation() = Eigen::Vector3d(1.0, 0.5, 0.0);     // meters
+T_odom_base.linear() =
+    Eigen::Quaterniond(/*w=*/0.7071, /*x=*/0.0, /*y=*/0.0, /*z=*/0.7071)
+        .normalized()
+        .toRotationMatrix();
+
+// Compose down the REP-105 tree, then transform a point base_link -> map.
+Eigen::Isometry3d T_map_base = T_map_odom * T_odom_base;
+Eigen::Vector3d p_map = T_map_base * Eigen::Vector3d(0.2, 0.0, 0.1);
+```
+
+Mind quaternion storage order: Eigen's constructor is `Quaterniond(w, x, y, z)`, but
+`coeffs()` and `geometry_msgs::msg::Quaternion` are `(x, y, z, w)`. Use the TF2 bridge
+instead of hand-copying components:
+
+```cpp
+#include <tf2_eigen/tf2_eigen.hpp>
+
+// TF2 lookup -> Eigen, and back. No manual (x,y,z,w) vs (w,x,y,z) juggling.
+Eigen::Isometry3d T = tf2::transformToEigen(
+    tf_buffer->lookupTransform("map", "base_link", tf2::TimePointZero));
+geometry_msgs::msg::TransformStamped out = tf2::eigenToTransform(T);
+```
+
+---
+
+## Forward / inverse kinematics
+
+Define the chain in **URDF** (preferred in ROS 2) rather than raw DH parameters — URDF
+is the single source of truth that TF2, MoveIt 2, and ros2_control all read. Forward
+kinematics is just the product of per-joint transforms:
+
+```cpp
+constexpr int kDof = 6;
+
+// FK: T_base_ee = T_0_1 * T_1_2 * ... * T_(n-1)_n
+Eigen::Isometry3d forwardKinematics(const std::array<Eigen::Isometry3d, kDof>& joint_tf) {
+  Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+  for (const auto& Ti : joint_tf) T = T * Ti;
+  return T;
+}
+```
+
+Inverse kinematics: use an **analytic** solver when one exists (e.g. a 6-DOF arm with a
+spherical wrist — closed form, fast, all solutions). Otherwise solve **numerically** via
+the Jacobian (Newton / damped least squares). Watch **singularities**: where the
+Jacobian loses rank, joint velocities blow up. Damp them (next section).
+
+---
+
+## Jacobians
+
+The **geometric Jacobian** `J(q)` maps joint rates to the end-effector spatial twist
+`[v; ω]` (3 linear + 3 angular), expressed in a chosen frame:
+
+```cpp
+// Fixed-size for a known DOF: stack-allocated and vectorizable (RT-safe).
+Eigen::Matrix<double, 6, kDof> J;                 // 6 x n
+Eigen::Matrix<double, kDof, 1> qdot;
+Eigen::Matrix<double, 6, 1> twist = J * qdot;     // [vx vy vz wx wy wz]
+```
+
+The **analytic Jacobian** maps joint rates to the time-derivative of a chosen pose
+*parameterization* (e.g. Euler-angle rates) and differs from the geometric one by a
+representation Jacobian — do not mix them. For a numeric IK step, invert with **damped
+least squares** so motion stays bounded near singularities:
+
+```cpp
+// dq = Jdls * twist_error;  lambda damps the blow-up at singular configurations.
+Eigen::Matrix<double, kDof, 6> dampedPinv(const Eigen::Matrix<double, 6, kDof>& J,
+                                          double lambda) {
+  Eigen::Matrix<double, 6, 6> JJt = J * J.transpose();
+  return J.transpose() *
+         (JJt + lambda * lambda * Eigen::Matrix<double, 6, 6>::Identity()).inverse();
+}
+```
+
+---
+
+## Equations of motion
+
+The rigid-body dynamics of an articulated robot are:
+
+```
+M(q) q̈ + C(q, q̇) q̇ + g(q) = τ   (+ Jᵀ F_ext)
+```
+
+where `M` is the symmetric positive-definite joint-space inertia matrix, `C q̇` the
+Coriolis/centrifugal terms, `g` gravity, and `τ` joint torques. **Do not hand-roll
+these** — sign and frame bugs are subtle and the algorithms (RNEA, CRBA, ABA) are
+well-optimized. Use **Pinocchio** (fast, analytic derivatives), **KDL** (Orocos, ships
+with ROS), or **Drake**.
+
+```cpp
+#include <pinocchio/algorithm/rnea.hpp>   // inverse dynamics
+#include <pinocchio/algorithm/crba.hpp>   // joint-space inertia M(q)
+
+pinocchio::crba(model, data, q);                       // data.M = M(q)
+pinocchio::computeGeneralizedGravity(model, data, q);  // data.g = g(q)
+Eigen::VectorXd tau = pinocchio::rnea(model, data, q, v, a);   // = M a + C v + g
+```
+
+---
+
+## Control basics
+
+- **PID**: baseline error feedback. Tune per joint; beware integrator windup.
+- **Feedforward**: add a model-based term (gravity comp, desired torque) so feedback
+  only corrects the residual — far better tracking than pure PID.
+- **Computed-torque / inverse-dynamics control**: cancel the nonlinear dynamics, then
+  place a linear error law on top.
+- **Impedance / admittance**: regulate the relationship between motion and force for
+  contact tasks (assembly, walking, compliant manipulation).
+
+```cpp
+// Computed torque:  tau = M(q)(q̈_des + Kp e + Kd ė) + C(q,q̇) q̇ + g(q)
+Eigen::VectorXd e    = q_des - q;
+Eigen::VectorXd edot = qd_des - qd;
+Eigen::VectorXd a_cmd = qdd_des + Kp.asDiagonal() * e + Kd.asDiagonal() * edot;
+Eigen::VectorXd tau   = pinocchio::rnea(model, data, q, qd, a_cmd);  // M a_cmd + C qd + g
+```
+
+Run control loops at **100 Hz – 1 kHz** (higher for stiff/contact-rich systems). This
+is exactly why the loop lives on the **real-time path** — a missed or jittery period
+means stale `q`, discontinuous `τ`, and instability. See [C++ Performance](./cpp-performance.md):
+no heap, no locks, no exceptions, no logging inside the control update.
+
+---
+
+## Numerical hygiene
+
+- **Consistent SI units.** Radians and meters internally; convert at boundaries only.
+- **Normalize quaternions** every integration step — unit-norm drift is real and
+  silently corrupts the rotation matrix.
+- **Avoid Euler storage.** Integrate orientation multiplicatively and renormalize:
+
+  ```cpp
+  // q_{k+1} = q_k ⊗ δq(ω dt), then renormalize.
+  Eigen::Quaterniond dq(1.0, 0.5 * omega.x() * dt,
+                             0.5 * omega.y() * dt,
+                             0.5 * omega.z() * dt);
+  q = (q * dq);
+  q.normalize();
+  ```
+
+- **Pick the integrator deliberately.** Semi-implicit (symplectic) Euler is cheap and
+  stable for many controllers; use RK4 for stiffer dynamics. Keep `dt` fixed in RT.
+- **Use fixed-size Eigen types** (`Vector3d`, `Matrix<double, 6, kDof>`) on the RT path:
+  stack-allocated, no heap, auto-vectorizable. Reserve dynamic-size for offline/setup.
+
+---
+
+## Conventions & common mistakes
+
+- **Mixing degrees and radians.** Every trig/Eigen API expects radians. Convert once at
+  the edge; never store degrees.
+- **Non-normalized quaternions.** Always `q.normalize()` after construction and after
+  each integration step; a drifted quaternion yields a non-orthonormal `R`.
+- **Wrong multiplication order.** Name transforms by frame pair and chain them so inner
+  frames cancel: `T_a_c = T_a_b * T_b_c`. `T_b_c * T_a_b` is meaningless.
+- **Quaternion component order.** Eigen ctor is `(w, x, y, z)`; `coeffs()` and ROS
+  messages are `(x, y, z, w)`. Bridge with `tf2_eigen`, don't copy fields by hand.
+- **Euler gimbal lock.** Don't parameterize orientation state or interpolation with
+  Euler angles; use quaternions (or rotation matrices).
+- **Geometric vs analytic Jacobian.** They are not interchangeable; pick one and keep
+  the twist/parameterization consistent across IK and control.
+- **`map` vs `odom`.** `map` can jump; running local feedback control off `map` injects
+  discontinuities. Control in the continuous `odom` frame.
+- **Inverting a near-singular Jacobian** with a plain `.inverse()` / pseudo-inverse —
+  use damped least squares.
+- **Hand-rolling `M`, `C`, `g`.** Use Pinocchio / KDL / Drake; hand-derived inertia is a
+  classic source of silent sign errors.
+
+---
+
+**Language**: All documentation should be written in **English**.

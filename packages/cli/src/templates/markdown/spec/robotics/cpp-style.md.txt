@@ -1,0 +1,208 @@
+# C++ Style
+
+> Naming, headers, include order, and namespaces for C++ on ROS 2. Follows the ROS 2
+> developer guide (Google C++ Style with ROS 2 deltas), enforced by `ament_clang_format`
+> and `ament_clang_tidy`.
+
+---
+
+## Overview
+
+This is the surface-level style standard: how files, types, and symbols are named, how
+headers are structured, and which constructs are banned. It exists so AI sessions and new
+contributors produce code that passes `colcon test` linters on the first try and reads
+like the rest of the ROS 2 ecosystem.
+
+Style is enforced mechanically — `clang-format` for layout, `clang-tidy` for semantics.
+Do not argue layout in review; run the formatter.
+
+---
+
+## File naming and layout
+
+- Source files: `snake_case.cpp`. Headers: `snake_case.hpp` (C++ headers use `.hpp`, never
+  `.h` — `.h` is reserved for C-compatible headers).
+- Public headers live under `include/<package_name>/`; private headers and `.cpp` live
+  under `src/`. The package-name subdirectory is mandatory so includes are unambiguous.
+- One primary class per file; the filename matches the class in snake_case
+  (`DiffDriveController` → `diff_drive_controller.hpp`).
+
+```text
+my_robot_controller/
+├── include/my_robot_controller/diff_drive_controller.hpp   # public
+├── src/diff_drive_controller.cpp                           # impl
+└── src/wheel_kinematics.hpp                                # private helper
+```
+
+## Include guards
+
+Use ament-style include guards in public headers. The guard is the path relative to
+`include/`, uppercased, `/` and `.` replaced by `__` and `_`, with a trailing underscore:
+
+```cpp
+// include/my_robot_controller/diff_drive_controller.hpp
+#ifndef MY_ROBOT_CONTROLLER__DIFF_DRIVE_CONTROLLER_HPP_
+#define MY_ROBOT_CONTROLLER__DIFF_DRIVE_CONTROLLER_HPP_
+// ...
+#endif  // MY_ROBOT_CONTROLLER__DIFF_DRIVE_CONTROLLER_HPP_
+```
+
+`#pragma once` is acceptable for purely private headers under `src/`, but installed public
+headers must use named guards — `ament_clang_tidy` flags missing guards on public headers.
+
+## Include order
+
+Group includes, separated by blank lines, in this order (matches `clang-format`'s
+`IncludeBlocks: Regroup`):
+
+```cpp
+#include "my_robot_controller/diff_drive_controller.hpp"  // 1. related header
+
+#include <cmath>        // 2. C system headers (rare; prefer C++ wrappers)
+
+#include <memory>       // 3. C++ standard library
+#include <string>
+#include <vector>
+
+#include <Eigen/Dense>  // 4. other third-party libraries
+
+#include "rclcpp/rclcpp.hpp"                  // 5. ROS / rclcpp
+#include "geometry_msgs/msg/twist.hpp"
+
+#include "my_robot_controller/wheel_kinematics.hpp"  // 6. this project
+```
+
+The related header comes first so the header is verified to be self-contained (it compiles
+without relying on a prior include). Use `<>` for system/third-party, `""` for project and
+ROS message headers.
+
+## Naming
+
+| Symbol | Convention | Example |
+|--------|------------|---------|
+| Type / class / struct / enum | `CamelCase` | `WheelKinematics`, `JointState` |
+| Function / method | `snake_case` (ROS 2 delta from Google) | `compute_odometry()` |
+| Variable / parameter | `snake_case` | `wheel_radius`, `target_velocity` |
+| Private member | trailing underscore | `wheel_radius_`, `node_handle_` |
+| Constant / `constexpr` | `kCamelCase` | `kMaxWheelSpeed`, `kDefaultQosDepth` |
+| Namespace | `snake_case` (package name) | `my_robot_controller` |
+| Macro (avoid) | `ALL_CAPS` | `RCLCPP_INFO` |
+
+```cpp
+namespace my_robot_controller
+{
+constexpr double kMaxWheelSpeed = 12.0;  // rad/s
+
+class WheelKinematics
+{
+public:
+  double compute_wheel_velocity(double body_velocity) const;
+
+private:
+  double wheel_radius_{0.0};
+};
+}  // namespace my_robot_controller
+```
+
+## Namespaces
+
+- Wrap every package's symbols in a namespace matching the package name. Close it with a
+  `// namespace <name>` comment.
+- Never `using namespace` in a header — it leaks into every translation unit that includes
+  it. In `.cpp` files, prefer specific `using std::placeholders::_1;` over pulling whole
+  namespaces.
+- Use anonymous namespaces (not `static`) for file-local helpers in `.cpp`.
+
+## Const-correctness, references, pointers
+
+- Mark methods that don't mutate state `const`. Pass read-only inputs by `const &`.
+- Prefer references over pointers when the argument is required and non-null. Use a pointer
+  only when null is a valid value or the argument is rebindable.
+- Use smart pointers (`std::unique_ptr`, `std::shared_ptr`) for ownership; ROS 2 node and
+  message handles are `shared_ptr` by convention (`rclcpp::Node::SharedPtr`).
+
+```cpp
+// Required, non-null input → const reference. Owns nothing.
+void update(const nav_msgs::msg::Odometry & odom);
+
+// Optional output → pointer (caller may pass nullptr to skip).
+void compute(double input, double * optional_debug_out);
+```
+
+## Modern C++ usage
+
+- `auto` when the type is obvious from the right-hand side (`auto node = std::make_shared<...>()`)
+  or unspellable (iterators, lambdas). Spell the type out when it aids readability.
+- `[[nodiscard]]` on functions whose return value must not be ignored (error codes, factory
+  results, `try_lock`).
+- `override` on every overriding method (`ament_clang_tidy` enforces it); never repeat
+  `virtual` on an override.
+- Brace-initialize members and locals to avoid uninitialized values: `double x_{0.0};`.
+
+## Error handling style
+
+- **Non-RT code** (setup, configuration, parameter loading, services): exceptions are fine.
+  Throw `std::runtime_error` / ROS 2 exception types; let `rclcpp` log and surface them.
+- **RT path** (controller `update()`, hardware read/write, any callback on the control
+  loop): no exceptions. Return an error code or a result type and handle it at the call
+  site. Use `[[nodiscard]]` so the code can't be silently dropped.
+
+```cpp
+// RT-safe: no throw, caller must check.
+[[nodiscard]] controller_interface::return_type
+update(const rclcpp::Time & time, const rclcpp::Duration & period);
+
+// Non-RT setup: throwing is acceptable.
+void configure(const rclcpp::Parameter & param)
+{
+  if (param.as_double() <= 0.0) {
+    throw std::invalid_argument("wheel_radius must be positive");
+  }
+}
+```
+
+If your toolchain provides it, `std::expected<T, Error>` (C++23) or `tl::expected` is
+preferred over out-parameters for RT result reporting — it is allocation-free and forces
+the caller to handle the error.
+
+## Tooling
+
+- `ament_clang_format` — layout, include regrouping, line length. Config: a `.clang-format`
+  at the workspace root based on the ROS 2 (Google-derived) style. Run before every commit.
+- `ament_clang_tidy` — include guards, `override`, modernize checks, naming. Config:
+  `.clang-tidy` at the workspace root.
+- Both run automatically under `colcon test` via `ament_lint_auto`; do not skip them.
+
+```bash
+# Format in place, then lint.
+ament_clang_format --reformat src include
+colcon test --packages-select my_robot_controller --event-handlers console_direct+
+```
+
+---
+
+## Forbidden patterns
+
+- `using namespace ...;` in any header — leaks symbols into all includers.
+- Raw `new` / `delete` — use `std::make_unique` / `std::make_shared` and RAII.
+- C-style casts (`(double)x`) — use `static_cast` / `reinterpret_cast` / `const_cast`.
+- `NULL` or `0` for pointers — use `nullptr`.
+- `.h` extension for C++ headers — use `.hpp`.
+- Throwing exceptions on the RT path — return error codes / result types instead.
+- `#pragma once` in installed public headers — use named ament-style guards.
+- Repeating `virtual` on an `override`, or omitting `override` entirely.
+
+---
+
+## Sourced standards
+
+Upstream style references, refreshable via `python3 .trellis/scripts/import_spec.py`.
+Edit anywhere outside the managed region below; the importer only rewrites inside it.
+
+<!-- trellis:managed:style-sources START -->
+<!-- Populated by import_spec.py from .trellis/spec-sources.json. -->
+<!-- trellis:managed:style-sources END -->
+
+---
+
+**Language**: All documentation should be written in **English**.

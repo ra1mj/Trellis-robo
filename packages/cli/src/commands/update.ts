@@ -45,6 +45,7 @@ import {
   workflowMdTemplate,
 } from "../templates/trellis/index.js";
 import { agentsMdContent } from "../templates/markdown/index.js";
+import { setRoboticsSkillsEnabled } from "../templates/common/index.js";
 
 import {
   ALL_MANAGED_DIRS,
@@ -361,6 +362,23 @@ function executeSafeFileDeletes(
   }
 
   return deleted;
+}
+
+/**
+ * Detect whether this project opted into robotics (config.yaml `robotics.enabled:
+ * true`). Used to keep robotics bundled skills in the managed set on update.
+ */
+function isRoboticsProject(cwd: string): boolean {
+  const configPath = path.join(cwd, DIR_NAMES.WORKFLOW, "config.yaml");
+  try {
+    const content = fs.readFileSync(configPath, "utf-8");
+    return (
+      /^robotics\s*:/m.test(content) &&
+      /^\s+enabled\s*:\s*true\b/m.test(content)
+    );
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -1839,6 +1857,11 @@ export async function update(options: UpdateOptions): Promise<void> {
     console.log(chalk.gray("Run 'trellis init' first."));
     return;
   }
+
+  // Robotics projects keep their ros2-* bundled skills in the managed set so
+  // update tracks (and never orphan-prunes) them. Non-robotics projects exclude
+  // them, matching what init wrote.
+  setRoboticsSkillsEnabled(isRoboticsProject(cwd));
 
   console.log(chalk.cyan("\nTrellis Update"));
   console.log(chalk.cyan("══════════════\n"));

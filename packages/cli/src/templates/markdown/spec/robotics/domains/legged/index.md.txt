@@ -1,0 +1,150 @@
+# Legged Robots (Quadruped / Humanoid)
+
+> Conventions for legged robots on ROS 2: floating-base dynamics, contact & gait,
+> whole-body control / MPC, state estimation, balance, and the real-time control loop.
+
+---
+
+## Overview
+
+This guide covers dynamically-balancing legged robots — quadrupeds and humanoids. Unlike
+fixed-base arms, a legged robot is a **floating base**: it is only connected to the world
+through intermittent foot contacts, so balance, contact scheduling, and state estimation
+are first-class concerns. Control runs at high rate on the real-time path — read
+[C++ Performance](../../cpp-performance.md) (no heap / locks / exceptions in the loop)
+and [Dynamics](../../dynamics.md) before writing controller code.
+
+---
+
+## Floating-base dynamics
+
+The configuration is `q = (p_base, R_base, q_joints)` — a 6-DoF unactuated base plus the
+actuated joints. The equation of motion includes the contact Jacobian and contact wrench
+`f_c`:
+
+```
+M(q) v_dot + C(q, v) v + g(q) = S^T tau + J_c^T(q) f_c
+```
+
+`S` is the actuation selection matrix (the base 6 DoF are unactuated, so the robot can
+only move its center of mass by pushing against contacts). Get `M`, `C`, `g`, and `J_c`
+from Pinocchio with a free-flyer base joint:
+
+```cpp
+pinocchio::Model model;
+pinocchio::urdf::buildModel(urdf, pinocchio::JointModelFreeFlyer(), model);
+pinocchio::crba(model, data, q);                 // M
+pinocchio::computeJointJacobians(model, data, q);// J_c per foot frame
+```
+
+---
+
+## Contact modeling & gait scheduling
+
+A **gait schedule** is a timed sequence of stance/swing phases per foot. The controller
+must always know which feet are in contact *right now*; that contact mode selects which
+columns of `J_c` and which constraints are active.
+
+```cpp
+enum class ContactState { Stance, Swing };
+struct GaitSchedule {
+  // contact[leg] queried at time t; e.g. trot = diagonal pairs alternate.
+  std::array<ContactState, 4> at(double t) const;
+};
+```
+
+Enforce the friction cone on each stance foot (`|f_tangential| <= mu * f_normal`) and
+keep `f_normal >= 0` — a controller that "pulls" on the ground or violates friction will
+slip or launch the robot.
+
+---
+
+## Whole-body control & MPC
+
+Two coordinated layers:
+
+- **MPC** (10–50 Hz): plans center-of-mass trajectory and contact forces a few steps
+  ahead using a reduced model (single rigid body / centroidal dynamics).
+- **WBC** (≥ 500 Hz): solves a per-tick QP that turns MPC's desired wrench into joint
+  torques while respecting the full dynamics, contact constraints, and joint limits.
+
+```
+min over (v_dot, tau, f_c)   sum_i w_i || A_i x - b_i ||^2     // weighted task QP
+s.t.  M v_dot + h = S^T tau + J_c^T f_c   (dynamics)
+      J_c v_dot + Jdot_c v = 0            (no-slip contact)
+      f_c in friction cone,  tau in limits
+```
+
+Tasks (tracking COM, swing-foot, body orientation) are prioritized by weight or strict
+hierarchy. The QP must solve within the control period — pre-allocate and warm-start it.
+
+---
+
+## State estimation
+
+There is no ground-truth base pose, so fuse:
+
+- **IMU** — orientation and base acceleration (high rate, drifts in position).
+- **Leg odometry** — when a foot is in stance, the base motion is constrained by joint
+  encoders + kinematics (the stance foot is fixed in the world).
+- **Contact estimation** — detect contact from force/torque, foot pressure, or estimated
+  joint torque vs. expected, to know *which* legs give valid leg odometry.
+
+A typical estimator is an EKF (or invariant-EKF) fusing IMU prediction with leg-odometry
+updates gated by the contact estimate. Bad contact detection corrupts leg odometry and
+the whole base estimate drifts.
+
+---
+
+## Balance: ZMP & capture point
+
+- **ZMP (Zero-Moment Point)** must stay inside the support polygon (the convex hull of
+  stance feet) for the robot not to tip.
+- **Capture Point** `xi = x_com + x_com_dot / sqrt(g / z)` predicts where to step to
+  come to rest; step placement targets the capture point for push recovery.
+
+Use these as constraints/targets in the MPC, and as a runtime safety monitor: if the ZMP
+leaves the support polygon or the capture point falls outside reachable footholds, switch
+to a recovery/damping behavior.
+
+---
+
+## Real-time control loop
+
+The WBC/torque loop is hard real time:
+
+- Run it on an isolated CPU with a `SCHED_FIFO` thread and a fixed period (e.g. 1 kHz).
+- No heap allocation, no locks, no exceptions, no logging inside the loop — see
+  [C++ Performance](../../cpp-performance.md). Pre-allocate the QP and all buffers.
+- Communicate with the (slower) MPC and ROS 2 layers through lock-free buffers, not
+  mutexes. A single missed deadline can make the robot fall.
+
+---
+
+## Simulation
+
+Develop against a physics sim before hardware: **Isaac Sim / Isaac Lab** (GPU, large-
+scale RL), **MuJoCo** (fast, accurate contact, great for control research), or **Gazebo**
+(tight ROS 2 / `ros2_control` integration). Match sim contact parameters (friction,
+stiffness) to hardware, and validate the same controller binary in sim and on the robot.
+
+---
+
+## Common mistakes
+
+- **State-estimation drift.** Trusting IMU integration or leg odometry through a missed
+  contact makes the base pose drift; gate leg odometry on a reliable contact estimate.
+- **Contact-mode errors.** Using the wrong stance set (gait schedule out of sync with
+  reality) activates the wrong constraints and the robot slips or trips.
+- **Control rate too low.** Running the WBC/torque loop below ~500 Hz (or missing
+  deadlines from allocation/locks) loses the bandwidth needed to balance.
+- **Friction-cone / unilateral violations.** Commanding contact forces that pull on the
+  ground or exceed the friction cone causes slipping and instability.
+- **ZMP outside support polygon.** Ignoring the balance constraint in planning makes the
+  robot tip; monitor it and trigger recovery.
+- **Sim-to-real contact mismatch.** Tuning on optimistic sim contact then deploying to a
+  stiffer/slippier real surface destabilizes the gait.
+
+---
+
+**Language**: All documentation should be written in **English**.

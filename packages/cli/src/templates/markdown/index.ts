@@ -95,3 +95,36 @@ export const guidesCrossLayerThinkingGuideContent: string = readLocalTemplate(
 export const guidesCodeReuseThinkingGuideContent: string = readLocalTemplate(
   "spec/guides/code-reuse-thinking-guide.md.txt",
 );
+
+// =============================================================================
+// Robotics spec pack (C++ / ROS 2). Scaffolded by `trellis init --robotics`.
+// Core docs are always written; domain docs are written per selection.
+// =============================================================================
+
+interface RoboticsDoc {
+  /** Destination filename written into the spec dir (.md, not .md.txt). */
+  name: string;
+  content: string;
+}
+
+const ROBOTICS_CORE_FILES = [
+  "index",
+  "cpp-style",
+  "cpp-performance",
+  "ros2-conventions",
+  "dynamics",
+  "build-tooling",
+] as const;
+
+/** Core robotics docs, always scaffolded when robotics is enabled. */
+export function getRoboticsCoreDocs(): RoboticsDoc[] {
+  return ROBOTICS_CORE_FILES.map((name) => ({
+    name: `${name}.md`,
+    content: readLocalTemplate(`spec/robotics/${name}.md.txt`),
+  }));
+}
+
+/** The `index.md` content for one robotics domain (e.g. "mobile"). */
+export function getRoboticsDomainDoc(domain: string): string {
+  return readLocalTemplate(`spec/robotics/domains/${domain}/index.md.txt`);
+}
